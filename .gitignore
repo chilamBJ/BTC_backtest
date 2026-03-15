@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 数据与输出（大文件不提交）
+data/*.csv
+collector_data/
+*.parquet
+
+# 项目本地配置
+.env
+.env.local
+*.local
+
+# 日志
+*.log
