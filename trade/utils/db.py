@@ -1,7 +1,7 @@
 """
 Trade 策略数据库模块（本项目专用）
 ==================================
-仅支持 seller、smart_seller、model_seller。配置从项目根 .env 加载。
+支持 seller、smart_seller、model_seller、paper_bot。配置从项目根 .env 加载。
 """
 
 import os
@@ -345,6 +345,75 @@ def init_model_seller_tables(conn):
             action VARCHAR(50) NOT NULL,
             detail TEXT,
             level VARCHAR(10) DEFAULT 'info'
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    conn.commit()
+    cur.close()
+
+
+def init_paper_bot_tables(conn):
+    """paper_bot_v2 策略表：paper_bot_trades 记录每根 5m 的决策结果。"""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ended_at DATETIME NULL,
+            mode VARCHAR(20) NOT NULL,
+            params JSON,
+            total_trades INT DEFAULT 0,
+            total_pnl DOUBLE DEFAULT 0,
+            summary TEXT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS paper_bot_trades (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT,
+            bar_epoch INT NOT NULL,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            action VARCHAR(30) NOT NULL,
+            slug VARCHAR(255),
+            direction VARCHAR(10),
+            prob DOUBLE,
+            feat_1 DOUBLE,
+            feat_2 DOUBLE,
+            feat_5 DOUBLE,
+            trend VARCHAR(10),
+            is_reversal TINYINT,
+            vol_regime DOUBLE,
+            skip_reason VARCHAR(80),
+            ask DOUBLE,
+            ask_size DOUBLE,
+            yes_token VARCHAR(255),
+            no_token VARCHAR(255),
+            question TEXT,
+            status VARCHAR(20) DEFAULT 'skipped',
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS action_log (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            asset VARCHAR(20),
+            market_slug VARCHAR(255),
+            action VARCHAR(50) NOT NULL,
+            detail TEXT,
+            level VARCHAR(10) DEFAULT 'info'
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS paper_bot_activity (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT NOT NULL,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            kline_count INT DEFAULT 0,
+            agg_buffer_sec INT DEFAULT 0,
+            last_decision_action VARCHAR(30),
+            last_bar_epoch INT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """)
     conn.commit()

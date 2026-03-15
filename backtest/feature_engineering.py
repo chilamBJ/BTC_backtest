@@ -146,6 +146,7 @@ def compute_features(
     # Feature 5: 4H VWAP 偏离度 (bps)，已在 5m 上按 48 根 K 线 rolling 算好，按 bar2_start 合并
     if "feat_5" in kline_5m.columns:
         right = kline_5m[["feat_5"]].copy()
+        right.index = pd.to_datetime(right.index, utc=True)
         right.index.name = "bar2_start"
         merged = feats[["bar2_start"]].merge(right, left_on="bar2_start", right_index=True, how="left")
         merged.index = feats.index
@@ -177,6 +178,7 @@ def compute_features(
     vol_regime = atr_1h / atr_24h.replace(0, np.nan)
     vol_regime = vol_regime.fillna(1.0).replace([np.inf, -np.inf], 1.0)
     right = pd.DataFrame({"feat_vol_regime": vol_regime})
+    right.index = pd.to_datetime(right.index, utc=True)
     right.index.name = "bar2_start"
     merged = feats[["bar2_start"]].merge(right, left_on="bar2_start", right_index=True, how="left")
     merged.index = feats.index

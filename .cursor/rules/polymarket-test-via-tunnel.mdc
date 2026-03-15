@@ -1,0 +1,42 @@
+---
+description: 连接 Polymarket 的测试一律经 SSH 隧道走云服务器网络
+alwaysApply: true
+---
+
+# Polymarket 相关测试：经 SSH 隧道使用云端网络
+
+**原则**：凡需连接 Polymarket API 或 CLOB 的本地测试/运行，应通过云服务器的网络访问，避免本机网络限制或不可达。本地先与云端代码保持同步，本地验证通过后再一次性部署到云端。
+
+## 使用方式
+
+1. **启动隧道（一个终端常开）**
+   ```bash
+   bash scripts/start_polymarket_tunnel.sh
+   ```
+   本机 `127.0.0.1:1080` 为 SOCKS5 代理，流量经云服务器访问 Polymarket。
+
+2. **在另一终端跑需要连 Polymarket 的测试**
+   - 方式 A：先设代理再执行
+     ```bash
+     export HTTP_PROXY=socks5://127.0.0.1:1080 HTTPS_PROXY=socks5://127.0.0.1:1080
+     python scripts/run_trade.py seller --duration 5m
+     ```
+   - 方式 B：用脚本自动带代理
+     ```bash
+     bash scripts/run_via_tunnel.sh -- python scripts/run_trade.py seller --duration 5m
+     bash scripts/run_via_tunnel.sh -- python scripts/run_trade.py smart_seller --duration 5m
+     ```
+
+3. **工作流**
+   - 本地修改代码 → 在本地通过隧道跑测试（如上）→ 确认无误后执行 `bash scripts/deploy_full_to_ecs.sh` 一次性推送到云端。
+
+## 适用场景
+
+- 本地运行 seller / smart_seller 的 dry-run 或 live 测试。
+- 本地脚本或单测中请求 Polymarket（Gamma、CLOB 等）。
+- 任何需要从本机访问 Polymarket 的调试或验证。
+
+## 例外
+
+- 仅跑与 Polymarket 无关的代码（如纯回测、Dashboard 仅读 MySQL、采集器读本地文件）时，无需启动隧道。
+- 直接在云端 SSH 里执行的命令已使用云端网络，无需隧道。

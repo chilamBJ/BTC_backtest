@@ -129,7 +129,7 @@ def get_wallet_balance():
 # ============================================================
 
 def get_available_strategies():
-    """返回有数据表的策略列表（本项目支持 seller / smart_seller / model_seller）"""
+    """返回有数据表的策略列表（本项目支持 seller / smart_seller / model_seller / paper_bot）"""
     strategies = []
     try:
         tables = db_query(None, "SHOW TABLES")
@@ -140,6 +140,8 @@ def get_available_strategies():
             strategies.append('smart_seller')
         if 'model_seller_trades' in table_names:
             strategies.append('model_seller')
+        if 'paper_bot_trades' in table_names:
+            strategies.append('paper_bot')
     except Exception:
         pass
     return strategies
@@ -169,6 +171,8 @@ def get_dashboard_data(strategy="seller", session_id=None):
         valid_sids = set(r['session_id'] for r in query_db("SELECT DISTINCT session_id FROM smart_seller_trades WHERE session_id IS NOT NULL"))
     elif strategy == 'model_seller':
         valid_sids = set(r['session_id'] for r in query_db("SELECT DISTINCT session_id FROM model_seller_trades WHERE session_id IS NOT NULL"))
+    elif strategy == 'paper_bot':
+        valid_sids = set(r['session_id'] for r in query_db("SELECT DISTINCT session_id FROM paper_bot_trades WHERE session_id IS NOT NULL"))
     else:
         valid_sids = {s.get('id') for s in sessions if s.get('id')}
     all_sessions = [s for s in sessions if s.get('id') in valid_sids]
@@ -263,6 +267,24 @@ def get_dashboard_data(strategy="seller", session_id=None):
             # 未触发原因：仅 model_seller 有，用于排查有 p_yes 但无交易的情况
             m["no_trigger_reason"] = m.get("no_trigger_reason")
         all_markets.extend(markets)
+    elif strategy == 'paper_bot':
+        markets = query_db(f"""
+            SELECT id, COALESCE(slug, CONCAT('btc-5m-', bar_epoch)) AS slug, 'BTC' AS asset, bar_epoch AS epoch,
+                   question, session_id, direction AS trigger_side, ask AS trigger_price,
+                   direction AS buy_side, ask AS entry_price, ask_size AS entry_amount, ask_size AS buy_shares,
+                   ts AS entry_at, action AS order_id, (action='filled') AS order_success,
+                   action AS outcome, NULL AS pnl, NULL AS settled_at, NULL AS settle_method,
+                   status, ts AS discovered_at, 'paper_bot' AS strategy_type,
+                   action AS exit_type, ask AS exit_price, skip_reason AS sl_reason, skip_reason,
+                   prob AS p_yes, feat_1, feat_2, feat_5, trend, is_reversal, vol_regime
+            FROM paper_bot_trades WHERE 1=1 {sid_filter}
+            ORDER BY bar_epoch DESC, id DESC
+        """, sid_params)
+        for m in markets:
+            m["entry_confidence"] = m.get("p_yes")
+            m["entry_decision"] = m.get("direction")
+            m["entry_momentum"] = m.get("trend")
+        all_markets.extend(markets)
     actions = query_db(f"""
         SELECT id, ts, market_slug, action, detail, level
         FROM action_log WHERE 1=1 {sid_filter} ORDER BY id
@@ -270,8 +292,12 @@ def get_dashboard_data(strategy="seller", session_id=None):
     all_actions.extend(actions)
 
     # 统计
-    entered = [m for m in all_markets if m.get("status") in ("entered", "settled")]
-    settled = [m for m in all_markets if m.get("status") == "settled" and m.get("pnl") is not None]
+    if strategy == 'paper_bot':
+        entered = [m for m in all_markets if m.get("status") == "filled"]
+        settled = []
+    else:
+        entered = [m for m in all_markets if m.get("status") in ("entered", "settled")]
+        settled = [m for m in all_markets if m.get("status") == "settled" and m.get("pnl") is not None]
     wins = [m for m in settled if m["pnl"] > 0]
     losses = [m for m in settled if m["pnl"] <= 0]
     total_pnl = sum(m["pnl"] for m in settled) if settled else 0
@@ -310,13 +336,20 @@ def get_dashboard_data(strategy="seller", session_id=None):
         if m.get("exit_type") == "stop_loss":
             asset_stats[a]["sl"] += 1
 
-    _tbl_map = {'seller': 'seller_trades', 'smart_seller': 'smart_seller_trades', 'model_seller': 'model_seller_trades'}
+    _tbl_map = {'seller': 'seller_trades', 'smart_seller': 'smart_seller_trades', 'model_seller': 'model_seller_trades', 'paper_bot': 'paper_bot_trades'}
     _tbl = _tbl_map.get(strategy)
     if _tbl:
         if all_sessions_filter:
-            # 全部轮次：总条数 = 实际返回行数（已按 session_id, slug 去重）
             real_total = len(all_markets)
             real_entered = len(entered)
+        elif strategy == 'paper_bot':
+            _cnt_rows = query_db(
+                f"SELECT COUNT(*) AS total, COUNT(CASE WHEN status='filled' THEN 1 END) AS entered_cnt FROM {_tbl} WHERE 1=1{sid_filter}",
+                sid_params,
+            )
+            _cnt = _cnt_rows[0] if _cnt_rows else {}
+            real_total = int(_cnt.get("total") or 0)
+            real_entered = int(_cnt.get("entered_cnt") or 0)
         else:
             _cnt_rows = query_db(
                 f"SELECT COUNT(DISTINCT slug) AS total,"
@@ -331,28 +364,58 @@ def get_dashboard_data(strategy="seller", session_id=None):
         real_total = len(all_markets)
         real_entered = len(entered)
 
-    stats = {
-        "total_markets": real_total,
-        "entered": real_entered,
-        "settled": len(settled),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": round(win_rate, 1),
-        "total_pnl": round(total_pnl, 4),
-        "total_cost": round(total_cost, 4),
-        "roi": round(total_pnl / total_cost * 100, 2) if total_cost > 0 else 0,
-        # 止损详情
-        "sl_count": len(sl_trades),
-        "sl_pnl": round(sl_pnl, 4),
-        "settle_count": len(settle_trades),
-        "settle_pnl": round(settle_pnl, 4),
-        "sl_normal": len(sl_normal),
-        "sl_fast": len(sl_fast),
-        "avg_sl_slippage": avg_sl_slippage,
-        "skipped_reentry": len(skipped_reentry),
-        "skipped_cooldown": len(skipped_cooldown),
-        "asset_stats": {k: {**v, "pnl": round(v["pnl"], 4)} for k, v in asset_stats.items()},
-    }
+    # paper_bot 专用统计
+    if strategy == 'paper_bot':
+        filled = [m for m in all_markets if m.get("action") == "filled"]
+        action_counts = {}
+        for m in all_markets:
+            a = m.get("action") or m.get("outcome") or "unknown"
+            action_counts[a] = action_counts.get(a, 0) + 1
+        stats = {
+            "total_markets": real_total,
+            "entered": len(filled),
+            "settled": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0,
+            "total_pnl": 0,
+            "total_cost": 0,
+            "roi": 0,
+            "sl_count": 0,
+            "sl_pnl": 0,
+            "settle_count": 0,
+            "settle_pnl": 0,
+            "sl_normal": 0,
+            "sl_fast": 0,
+            "avg_sl_slippage": 0,
+            "skipped_reentry": 0,
+            "skipped_cooldown": 0,
+            "asset_stats": {},
+            "paper_bot_filled": len(filled),
+            "paper_bot_actions": action_counts,
+        }
+    else:
+        stats = {
+            "total_markets": real_total,
+            "entered": real_entered,
+            "settled": len(settled),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 1),
+            "total_pnl": round(total_pnl, 4),
+            "total_cost": round(total_cost, 4),
+            "roi": round(total_pnl / total_cost * 100, 2) if total_cost > 0 else 0,
+            "sl_count": len(sl_trades),
+            "sl_pnl": round(sl_pnl, 4),
+            "settle_count": len(settle_trades),
+            "settle_pnl": round(settle_pnl, 4),
+            "sl_normal": len(sl_normal),
+            "sl_fast": len(sl_fast),
+            "avg_sl_slippage": avg_sl_slippage,
+            "skipped_reentry": len(skipped_reentry),
+            "skipped_cooldown": len(skipped_cooldown),
+            "asset_stats": {k: {**v, "pnl": round(v["pnl"], 4)} for k, v in asset_stats.items()},
+        }
 
     out = {
         "stats": stats,
@@ -378,6 +441,21 @@ def get_dashboard_data(strategy="seller", session_id=None):
                 out["model_seller_activity"] = None
         except Exception:
             out["model_seller_activity"] = None
+    elif strategy == "paper_bot":
+        try:
+            if session_id and str(session_id) != "all":
+                act = query_db(
+                    "SELECT * FROM paper_bot_activity WHERE session_id = %s ORDER BY id DESC LIMIT 1",
+                    (int(session_id),),
+                )
+            else:
+                act = query_db("SELECT * FROM paper_bot_activity ORDER BY id DESC LIMIT 1")
+            if act:
+                out["paper_bot_activity"] = act[0]
+            else:
+                out["paper_bot_activity"] = None
+        except Exception:
+            out["paper_bot_activity"] = None
     return out
 
 
@@ -938,6 +1016,29 @@ function render(data) {
     h+='</div>';
   }
 
+  // 模拟盘V2 运行状态（仅 paper_bot）
+  if(data.current_strategy==='paper_bot' && data.paper_bot_activity){
+    const a=data.paper_bot_activity;
+    const ts=a.ts?(new Date(a.ts).toLocaleTimeString('zh-CN',{hour12:false})):'';
+    h+='<div class="section" style="margin-top:12px"><div class="section-header"><span class="section-title">\uD83D\uDD04 模拟盘V2 运行状态</span><span class="section-count">'+ts+' 更新</span></div>';
+    h+='<div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">';
+    h+=statCard('K线缓存',a.kline_count!=null?a.kline_count:'-','根 5m');
+    h+=statCard('aggBuffer',a.agg_buffer_sec!=null?a.agg_buffer_sec:'-','秒');
+    h+=statCard('上次决策',a.last_decision_action||'-','');
+    h+=statCard('上次 bar_epoch',a.last_bar_epoch!=null?a.last_bar_epoch:'-','');
+    h+='</div>';
+    if(s.paper_bot_actions && Object.keys(s.paper_bot_actions).length>0){
+      h+='<div style="margin-top:10px"><div class="section-title" style="font-size:12px;color:var(--text2)">决策动作分布</div>';
+      h+='<div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr))">';
+      Object.entries(s.paper_bot_actions).forEach(([act,cnt])=>{
+        const actName={'event_skip':'事件跳过','prob_in_range':'概率区间','risk_block':'风控拦截','pm_not_found':'PM未找到','no_ask':'无Ask','thin_book_skip':'盘口薄','slippage_skip':'滑点放弃','filled':'虚拟成交'}[act]||act;
+        h+=statCard(actName,cnt,'次','neutral');
+      });
+      h+='</div></div>';
+    }
+    h+='</div>';
+  }
+
   // Stop-loss analysis panel (seller strategy)
   if(s.sl_count > 0 || s.settle_count > 0) {
     h+='<div class="section"><div class="section-header"><span class="section-title">&#x1F6E1;&#xFE0F; 止损 &amp; 保护分析</span></div>';
@@ -974,8 +1075,8 @@ function render(data) {
     h+='<div class="table-wrap"><table><tr><th>市场</th><th>剩余时间</th><th class="hide-mobile">策略</th><th>状态</th><th>方向</th><th>买入价</th><th class="hide-mobile">金额</th><th class="hide-mobile">触发/信心</th><th class="hide-mobile">未触发原因</th><th>结果</th><th class="hide-mobile">退出</th><th>盈亏</th></tr>';
     data.markets.forEach(m=>{
       const side=m.entry_side?'<span class="'+(m.entry_side==='YES'?'positive':'negative')+'">'+m.entry_side+'</span>':'-';
-      let stName = m.strategy_type==='seller'?'卖方':m.strategy_type==='smart_seller'?'智能卖方':m.strategy_type==='model_seller'?'模型卖方':'趋势';
-      let stCls = m.strategy_type==='seller'?'act-settle':m.strategy_type==='smart_seller'?'act-place_order':m.strategy_type==='model_seller'?'act-entry_signal':'act-discover';
+      let stName = m.strategy_type==='seller'?'卖方':m.strategy_type==='smart_seller'?'智能卖方':m.strategy_type==='model_seller'?'模型卖方':m.strategy_type==='paper_bot'?'模拟盘V2':'趋势';
+      let stCls = m.strategy_type==='seller'?'act-settle':m.strategy_type==='smart_seller'?'act-place_order':m.strategy_type==='model_seller'?'act-entry_signal':m.strategy_type==='paper_bot'?'act-entry_signal':'act-discover';
       const st='<span class="act '+stCls+'" style="font-size:10px">'+stName+'</span>';
       const conf=(m.strategy_type==='seller'||m.strategy_type==='smart_seller')?(m.trigger_side?'卖'+m.trigger_side+'@'+fpr(m.trigger_price):'-'):(m.entry_confidence!=null?m.entry_confidence.toFixed(3):'-');
       const noTrig=m.no_trigger_reason?(m.no_trigger_reason==='event_ok_false'?'事件不满足':m.no_trigger_reason==='prob_in_range'?'概率区间':m.no_trigger_reason==='no_model'?'无模型':m.no_trigger_reason):'-';
@@ -1057,7 +1158,7 @@ function render(data) {
 
 function updateStratTabs(strategies, active) {
   const c=document.getElementById('stratTabs');
-  const names={seller:'📉 卖方策略',trend:'📈 趋势策略',smart_seller:'🧠 智能卖方',model_seller:'🤖 模型卖方'};
+  const names={seller:'📉 卖方策略',trend:'📈 趋势策略',smart_seller:'🧠 智能卖方',model_seller:'🤖 模型卖方',paper_bot:'📝 模拟盘V2'};
   c.innerHTML=strategies.map(s=>
     '<button class="strat-tab'+(s===active?' active':'')+'" onclick="switchStrategy(\''+s+'\')">'+(names[s]||s)+'</button>'
   ).join('');

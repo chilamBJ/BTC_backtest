@@ -498,29 +498,36 @@ def _market_text(m: dict) -> str:
 
 
 def _is_btc_5m_market(m: dict) -> bool:
-    """判断是否为当前可用的 BTC 5 分钟市场。兼容 5m / 5 m / 5-m / 5min 等写法。"""
+    """判断是否为当前可用的 BTC 5 分钟市场。兼容 5m / 5 m / 5-m / 5min 等写法。排除 15m 市场。"""
     q = _market_text(m)
     has_btc = "btc" in q or "bitcoin" in q
+    has_15m = any(p in q for p in ("15m", "15 m", "15-m", "15min", "15 min"))
+    if has_15m:
+        return False
     has_5m = any(p in q for p in ("5m", "5 m", "5-m", "5min", "5 min"))
     return has_btc and has_5m
 
 
 def _is_btc_15m_market(m: dict) -> bool:
-    """判断是否为当前可用的 BTC 15 分钟市场。兼容 15m / 15 m / 15-m / 15min 等写法。"""
+    """判断是否为当前可用的 BTC 15 分钟市场。兼容 15m / 15 m / 15-m / 15min 等写法。排除 5m 市场。"""
     q = _market_text(m)
     has_btc = "btc" in q or "bitcoin" in q
+    has_5m = any(p in q for p in ("5m", "5 m", "5-m", "5min", "5 min"))
+    if has_5m:
+        return False
     has_15m = any(p in q for p in ("15m", "15 m", "15-m", "15min", "15 min"))
     return has_btc and has_15m
 
 
 async def pm_market_router() -> None:
     """
-    动态市场路由：每 PM_MARKET_ROUTER_INTERVAL 秒通过 Gamma API 拉取当前 BTC 5m/15m 市场。
-    使用 Events API + 计算 slug（btc-updown-5m-{ts} / btc-updown-15m-{ts}），
-    因 Polymarket 的 5m/15m 市场不出现在 /markets 列表中。
+    动态市场路由：每 PM_MARKET_ROUTER_INTERVAL 秒请求市场。
+    优先 /markets 全局遍历；若 5m/15m 未命中则回退到 /events?slug= 按时间戳查询。
+    5m 和 15m 完全独立，绝不互相覆盖。
     """
     global active_pm_markets
     import aiohttp
+    markets_url = f"{PM_GAMMA_URL}/markets"
     events_url = f"{PM_GAMMA_URL}/events"
     fail_count = 0
     headers = {"User-Agent": "Mozilla/5.0 (compatible; BTCCollector/1.0)"}
@@ -531,64 +538,84 @@ async def pm_market_router() -> None:
             new_15m = None
             last_err = None
             async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                now_ts = int(time.time())
-                base_5 = (now_ts // 300) * 300
-                base_15 = (now_ts // 900) * 900
-                for slug_prefix, base, window in [
-                    ("btc-updown-5m", base_5, 300),
-                    ("btc-updown-15m", base_15, 900),
-                ]:
-                    for offset in (0, -window, window, -2 * window, 2 * window):
-                        ts = base + offset
-                        slug = f"{slug_prefix}-{ts}"
+                # 1. 优先尝试 /markets 全局遍历
+                try:
+                    async with session.get(
+                        markets_url,
+                        params={"active": "true", "closed": "false", "limit": 500},
+                    ) as resp:
+                        if resp.status != 200:
+                            last_err = f"markets HTTP {resp.status}"
+                        else:
+                            data = await resp.json()
+                            markets = data if isinstance(data, list) else (data.get("data") or data.get("markets") or [])
+                            if not isinstance(markets, list):
+                                last_err = "markets not a list"
+                            else:
+                                for m in markets:
+                                    cid = m.get("conditionId") or m.get("condition_id")
+                                    tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
+                                    if not cid or len(tokens) < 2:
+                                        continue
+                                    info = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
+                                    if _is_btc_5m_market(m):
+                                        new_5m = info
+                                    if _is_btc_15m_market(m):
+                                        new_15m = info
+                                if not new_5m and not new_15m:
+                                    last_err = "no 5m/15m in markets"
+                except Exception as ex:
+                    last_err = f"markets: {str(ex)[:60]}"
+
+                # 2. 回退：若 5m 未命中，用 /events?slug=btc-updown-5m-{ts} 查询
+                if new_5m is None:
+                    now_ts = int(time.time())
+                    base_5 = (now_ts // 300) * 300
+                    for offset in (0, -300, 300, -600, 600):
+                        ts = base_5 + offset
+                        slug = f"btc-updown-5m-{ts}"
                         try:
                             async with session.get(events_url, params={"slug": slug}) as resp:
                                 if resp.status != 200:
-                                    last_err = f"HTTP {resp.status}"
                                     continue
                                 data = await resp.json()
-                        except Exception as ex:
-                            last_err = str(ex)[:80]
+                            events = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
+                            if isinstance(events, list) and events and events[0].get("markets"):
+                                m = events[0]["markets"][0]
+                                cid = m.get("conditionId") or m.get("condition_id")
+                                tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
+                                if cid and len(tokens) >= 2:
+                                    new_5m = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
+                                    break
+                        except Exception:
                             continue
-                        events = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
-                        if not isinstance(events, list) or not events:
-                            last_err = "empty"
-                            continue
-                        e = events[0]
-                        markets = e.get("markets") or []
-                        if not markets:
-                            last_err = "no markets"
-                            continue
-                        m = markets[0]
-                        cid = m.get("conditionId") or m.get("condition_id")
-                        tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
-                        if cid and len(tokens) >= 2:
-                            info = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
-                            if "5m" in slug_prefix:
-                                new_5m = info
-                            else:
-                                new_15m = info
-                            break
-            if new_5m and not new_15m:
-                async with aiohttp.ClientSession(headers=headers, timeout=timeout) as retry_session:
+
+                # 3. 回退：若 15m 未命中，用 /events?slug=btc-updown-15m-{ts} 查询（与 5m 完全独立）
+                if new_15m is None:
+                    now_ts = int(time.time())
+                    base_15 = (now_ts // 900) * 900
                     for offset in (0, -900, 900, -1800, 1800):
                         ts = base_15 + offset
                         slug = f"btc-updown-15m-{ts}"
                         try:
-                            async with retry_session.get(events_url, params={"slug": slug}) as resp:
+                            async with session.get(events_url, params={"slug": slug}) as resp:
                                 if resp.status != 200:
                                     continue
                                 data = await resp.json()
+                            events = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
+                            if isinstance(events, list) and events and events[0].get("markets"):
+                                m = events[0]["markets"][0]
+                                cid = m.get("conditionId") or m.get("condition_id")
+                                tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
+                                if cid and len(tokens) >= 2:
+                                    new_15m = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
+                                    break
                         except Exception:
                             continue
-                        events = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
-                        if isinstance(events, list) and events and events[0].get("markets"):
-                            m = events[0]["markets"][0]
-                            cid = m.get("conditionId") or m.get("condition_id")
-                            tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
-                            if cid and len(tokens) >= 2:
-                                new_15m = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
-                                break
+
+                if new_5m is None and new_15m is None and last_err is None:
+                    last_err = "markets+events fallback both failed"
+
             prev_5m = active_pm_markets.get("5m", {}).get("condition_id")
             prev_15m = active_pm_markets.get("15m", {}).get("condition_id")
             updated = {}

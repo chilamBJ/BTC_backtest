@@ -2,6 +2,8 @@
 
 基于 methodology.md 的 BTC 5 分钟 K 线连续趋势预测回测与 Polymarket 二元期权策略研究。
 
+命名规范见 [docs/NAMING.md](docs/NAMING.md)（策略 ID、轮次/批次、DB、界面用语等）。
+
 ## 项目结构
 
 ```
@@ -12,9 +14,10 @@ BTC_backtest/
 │   └── model_backtest.py   # LGBM 训练、阈值分析、归因报告
 ├── collector/          # 数据采集模块
 │   └── data_collector.py   # Binance + Polymarket 7x24 采集
-├── trade/              # Polymarket 交易策略（本项目在用，仅 seller/smart_seller+Dashboard）
+├── trade/              # Polymarket 交易策略（本项目在用，seller/smart_seller/model_seller+Dashboard）
 │   ├── strategies/seller/       # 卖方策略
 │   ├── strategies/smart_seller/ # 智能卖方策略
+│   ├── strategies/model_seller/ # 回测实盘化模型策略
 │   ├── tools/web_dashboard.py   # 交易监控 Dashboard
 │   └── utils/db.py              # MySQL 连接与表结构
 ├── trade_backup/       # 参考备份（可删除，删除后不影响运行）
@@ -46,7 +49,7 @@ python run_backtest.py --kline-5m data/BINANCE_BTCUSDT_5m_*.csv --trades-1s data
 python run_collector.py
 ```
 
-### Trade 策略（seller / smart_seller）与 Dashboard
+### Trade 策略（seller / smart_seller / model_seller）与 Dashboard
 
 **统一配置**：全项目只用一份 `.env`（项目根）、一份 `requirements.txt`。策略与 Dashboard 从项目根读配置。`trade/` 为运行所需的最小文件；`trade_backup/` 为原始参考备份，可随时删除。
 
@@ -62,7 +65,7 @@ pip install -r requirements.txt
 
 - `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE`
 
-首次运行策略时会自动创建 `sessions`、`seller_trades` / `smart_seller_trades`、`action_log` 等表。
+首次运行策略时会自动创建 `sessions`、`seller_trades` / `smart_seller_trades` / `model_seller_trades`、`action_log` 等表。
 
 **检查 MySQL 是否就绪**（与 .env 一致时应能连上）：
 
@@ -79,6 +82,9 @@ python scripts/run_trade.py seller --duration 2h
 
 # 智能卖方策略
 python scripts/run_trade.py smart_seller --duration 2h
+
+# 模型卖方策略（需先配置模型路径）
+python scripts/run_trade.py model_seller --duration 2h --market-window both
 ```
 
 **3. 实盘（需在 .env 中配置 Polymarket 相关）**
@@ -93,13 +99,18 @@ python scripts/run_trade.py smart_seller --duration 2h
 ```bash
 python scripts/run_trade.py seller --live --amount 2 --duration 4h
 python scripts/run_trade.py smart_seller --live --amount 2 --assets btc,eth
+python scripts/run_trade.py model_seller --live --amount 2 --market-window both
 ```
 
 **4. Dashboard（查看会话与成交）**
 
-确保 MySQL 中已有策略表（至少跑过一次 seller 或 smart_seller），然后：
+确保 MySQL 中已有策略表（至少跑过一次 seller / smart_seller / model_seller），然后：
 
 ```bash
+# 推荐：若 8080 已被占用会先 kill 再启动，保证 Dashboard 独占 8080
+bash scripts/start_dashboard.sh
+
+# 或直接指定端口
 python scripts/run_trade.py dashboard
 # 默认 http://localhost:8080，可加 --port 9090
 ```
@@ -108,6 +119,90 @@ python scripts/run_trade.py dashboard
 
 - `python scripts/run_trade.py seller --help`
 - `python scripts/run_trade.py smart_seller --help`
+- `python scripts/run_trade.py model_seller --help`
+
+`model_seller` 额外配置：
+
+- `.env` 增加 `MODEL_SELLER_MODEL_PATH=/absolute/path/to/model.pkl`
+- 或启动时使用 `--model-path /absolute/path/to/model.pkl`
+
+**5. 本地测试需连 Polymarket 时：SSH 隧道**
+
+本机若无法直连 Polymarket，或希望与云端环境一致，可经云服务器网络访问。
+
+**操作步骤：**
+
+1. **终端 1**：启动隧道（保持运行）
+   ```bash
+   bash scripts/start_polymarket_tunnel.sh
+   ```
+   需 `.env` 中有 `DEPLOY_PASSWORD`（或按提示输入密码）。成功后会在 `127.0.0.1:1080` 建立 SOCKS5 代理。
+
+2. **终端 2**：经隧道运行策略
+   ```bash
+   # 模拟盘
+   bash scripts/run_via_tunnel.sh -- python scripts/run_trade.py seller --duration 1h
+
+   # 实盘（加 --live）
+   bash scripts/run_via_tunnel.sh -- python scripts/run_trade.py seller --live --amount 2 --duration 1h
+   ```
+
+3. **确认走代理**：终端输出中应出现 `✅ 请求经代理: socks5://127.0.0.1:1080`。若提示 `⚠️ aiohttp-socks 未安装`，先执行：
+   ```bash
+   pip install aiohttp-socks
+   ```
+
+4. **查看结果**：本地启动 Dashboard（`bash scripts/start_dashboard.sh`）访问 http://localhost:8080，或直接看策略终端日志。
+
+**推荐流程**：本地改代码 → 经隧道在本地跑测试 → 确认无误后执行 `bash scripts/deploy_full_to_ecs.sh` 一次性推送到云端。
+
+**6. 云端跑模拟盘**
+
+部署到 ECS 后，需在服务器上配置 MySQL（库 `poly`、用户 `poly`），再启动模拟盘：
+
+```bash
+# 本地执行：在云端创建 MySQL 库和用户（与 .env 中 MYSQL_* 一致）
+bash scripts/remote_mysql_setup.sh
+
+# 本地执行：部署完整项目到云端
+bash scripts/deploy_full_to_ecs.sh
+
+# 云端跑模拟盘（SSH 上去后执行，或使用 scripts/ssh_remote.sh）
+ssh root@<服务器> 'cd /root/btc_collector && source venv/bin/activate && python3 scripts/run_trade.py seller --duration 2h'
+# 后台跑（务必加 PYTHONUNBUFFERED=1 否则日志不实时）：PYTHONUNBUFFERED=1 nohup python3 scripts/run_trade.py seller --duration 2h >> trade_seller.log 2>&1 &
+# 本地看日志（命令末尾的引号必须闭合）：
+#   bash scripts/ssh_remote.sh "tail -f /root/btc_collector/trade_seller.log"
+# 若日志一直为空，需用无缓冲重启模拟盘后再 tail：
+#   bash scripts/ssh_remote.sh "cd /root/btc_collector && pkill -f 'run_trade.py seller' 2>/dev/null; source venv/bin/activate && PYTHONUNBUFFERED=1 nohup python3 scripts/run_trade.py seller --duration 2h >> trade_seller.log 2>&1 &"
+```
+
+**7. 访问云端 Dashboard 与实时看模拟盘输出**
+
+两种方式：
+
+- **方式一：实时日志（模拟盘终端输出）**  
+  在本地执行（末尾引号要闭合）：
+  ```bash
+  bash scripts/ssh_remote.sh "tail -f /root/btc_collector/trade_seller.log"
+  ```
+  即可在本地终端里实时看到云端模拟盘的打印内容（发现市场、监控、挂单等），Ctrl+C 退出。
+
+- **方式二：Web Dashboard（会话 / 成交 / PnL）**  
+  **A. 公网直连（推荐，无需 SSH 隧道）**  
+  1）在云端启动 Dashboard（默认已监听 0.0.0.0）：
+  ```bash
+  bash scripts/ssh_remote.sh "cd /root/btc_collector && source venv/bin/activate && nohup python3 scripts/run_trade.py dashboard --port 8080 >> dashboard.log 2>&1 &"
+  ```
+  2）在云服务器控制台（如阿里云 ECS）的**安全组**里放行**入方向**端口 **8080**（协议 TCP）。  
+  3）在浏览器打开：**http://47.238.152.210:8080**（将 IP 换成你的服务器公网 IP）。  
+  即可直接访问 Poly Trader Dashboard。
+
+  **B. SSH 隧道（不开放公网端口时使用）**  
+  1）同上在云端启动 Dashboard。  
+  2）本地执行并保持终端不关：`ssh -L 8080:localhost:8080 root@47.238.152.210`  
+  3）浏览器打开：**http://localhost:8080**
+
+  说明：Dashboard 无登录验证，公网开放后任何人知悉地址即可访问，建议仅在可信环境使用或通过安全组限制来源 IP。
 
 ## 依赖
 
@@ -117,7 +212,7 @@ pip install -r requirements.txt
 
 ## 云端部署与代码同步
 
-采集器部署在香港 ECS，使用 systemd 管理。**本地为代码源，云端通过部署脚本同步。**
+采集器与 Trade/Dashboard 部署在香港 ECS。**本地为代码源，云端通过部署脚本同步。** 需要连接 Polymarket 的改动：先在本地经 SSH 隧道测试（见上文「本地测试需连 Polymarket 时：SSH 隧道」），通过后再执行全量部署。
 
 ### 部署到云端
 

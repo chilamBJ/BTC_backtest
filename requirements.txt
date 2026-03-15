@@ -7,6 +7,7 @@ lightgbm>=4.0.0
 shap>=0.43.0
 # data_collector 依赖
 aiohttp>=3.9.0
+aiohttp-socks>=0.8.0
 python-telegram-bot>=21.0
 # sync_parquet_from_ecs 依赖
 pexpect>=4.8.0
@@ -15,4 +16,4 @@ pymysql>=1.1.0
 DBUtils>=3.0.0
 python-dotenv>=0.20.0
 py-clob-client>=0.34.0
-httpx>=0.24.0
+httpx[socks]>=0.24.0

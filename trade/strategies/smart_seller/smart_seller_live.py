@@ -708,8 +708,8 @@ class SmartSellerStrategy:
                  reprice_gap: float = 0.02,
                  assets: List[str] = None,
                  phase_filter: str = "mid",     # all / mid / late  (默认mid: 禁止close阶段)
-                 min_elapsed: float = 300.0,    # 最少等300秒才触发 (回测最优)
-                 max_elapsed: float = 600.0,    # 最晚入场时间(秒), 10min后不再入场 (回测10min+PnL为负)
+                 min_elapsed_pct: float = 0.333,  # 入场窗口开始: 占窗口百分比 (300/900≈33%)
+                 max_elapsed_pct: float = 0.667,  # 入场窗口结束: 占窗口百分比 (600/900≈67%)
                  max_buy_price: float = 0.85,   # 最高买入价, 超过跳过 (0.85+实盘PnL下降)
                  sl_trigger: float = 0.0,      # 止损触发: 低价方涨回此值时平仓 (0=不止损)
                  sl_confirm: int = 3,           # 止损确认: 连续N次检测才触发 (防正常波动)
@@ -734,8 +734,8 @@ class SmartSellerStrategy:
         self.reprice_gap = reprice_gap
         self.assets = [a.lower() for a in (assets or ["btc"])]
         self.phase_filter = phase_filter.lower()
-        self.min_elapsed = min_elapsed
-        self.max_elapsed = max_elapsed          # 最晚入场时间
+        self.min_elapsed_pct = min_elapsed_pct
+        self.max_elapsed_pct = max_elapsed_pct  # 入场窗口占窗口百分比
         self.max_buy_price = max_buy_price      # 最高买入价
         self.sl_trigger = sl_trigger            # 止损触发价 (低价方)
         self.sl_confirm = max(sl_confirm, 1)    # 至少1次
@@ -781,8 +781,8 @@ class SmartSellerStrategy:
             "reprice_gap": reprice_gap,
             "assets": self.assets,
             "phase_filter": phase_filter,
-            "min_elapsed": min_elapsed,
-            "max_elapsed": max_elapsed,
+            "min_elapsed_pct": min_elapsed_pct,
+            "max_elapsed_pct": max_elapsed_pct,
             "max_buy_price": max_buy_price,
             "sl_trigger": sl_trigger,
             "sl_confirm": sl_confirm,
@@ -963,10 +963,12 @@ class SmartSellerStrategy:
             if in_night:
                 return None  # 夜间静默，不记录日志（高频触发）
 
-        # 时间窗口过滤: 太早或太晚都不入场
-        if elapsed < self.min_elapsed:
+        # 时间窗口过滤: 太早或太晚都不入场 (按窗口百分比)
+        min_sec = self.window * self.min_elapsed_pct
+        max_sec = self.window * self.max_elapsed_pct
+        if elapsed < min_sec:
             return None
-        if self.max_elapsed > 0 and elapsed > self.max_elapsed:
+        if self.max_elapsed_pct > 0 and elapsed > max_sec:
             return None
 
         phase = self._get_phase(elapsed)
@@ -1586,8 +1588,21 @@ class SmartSellerStrategy:
     # ------ 主循环 ------
 
     async def run(self, duration_sec: float = 0):
-        connector = aiohttp.TCPConnector(family=2)  # IPv4 only
-        self.http_session = aiohttp.ClientSession(connector=connector)
+        proxy_url = (os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY") or "").strip()
+        if proxy_url and "socks" in proxy_url.lower():
+            try:
+                from aiohttp_socks import ProxyConnector
+                connector = ProxyConnector.from_url(proxy_url)
+                print("  ✅ 请求经代理: " + (proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url))
+            except ImportError:
+                connector = aiohttp.TCPConnector(family=2)
+                print("  ⚠️ 未安装 aiohttp-socks，SOCKS 代理未生效，请: pip install aiohttp-socks")
+        else:
+            connector = aiohttp.TCPConnector(family=2)
+        self.http_session = aiohttp.ClientSession(
+            connector=connector,
+            trust_env=bool(proxy_url and "socks" not in proxy_url.lower()),
+        )
 
         mode = "🏷️ DRY-RUN" if self.dry_run else "💰 LIVE TRADING"
         print(f"\n{'='*60}")
@@ -1598,7 +1613,7 @@ class SmartSellerStrategy:
         print(f"  触发阈值:   ≤ {self.threshold:.0%} (低价方)")
         print(f"  最低阈值:   ≥ {self.min_threshold:.0%} (过滤噪音)")
         print(f"  最高买价:   ≤ {self.max_buy_price:.0%} (过滤高价入场)")
-        print(f"  入场窗口:   {self.min_elapsed:.0f}s ~ {self.max_elapsed:.0f}s")
+        print(f"  入场窗口:   {self.min_elapsed_pct:.0%} ~ {self.max_elapsed_pct:.0%} (占窗口)")
         print(f"  阶段过滤:   {self.phase_filter}")
         if self.fixed_shares > 0:
             print(f"  下单方式:   固定 {self.fixed_shares:.0f} shares/笔 (忽略 bet_amount)")
@@ -2363,10 +2378,10 @@ def main():
                         help="触发阈值: 低于此价格视为虚值 (默认0.20)")
     parser.add_argument("--min-threshold", type=float, default=0.05,
                         help="最低阈值: 低于此价格不交易,避免噪音 (默认0.05)")
-    parser.add_argument("--min-elapsed", type=float, default=300.0,
-                        help="最少等多少秒才触发 (默认300, 回测最优)")
-    parser.add_argument("--max-elapsed", type=float, default=600.0,
-                        help="最晚入场时间(秒), 超过不再入场 (默认600=10min)")
+    parser.add_argument("--min-elapsed", type=float, default=0.333,
+                        help="入场窗口开始: 占窗口百分比 0~1 (默认0.333=33%%)")
+    parser.add_argument("--max-elapsed", type=float, default=0.667,
+                        help="入场窗口结束: 占窗口百分比 0~1 (默认0.667=67%%)")
     parser.add_argument("--max-buy-price", type=float, default=0.85,
                         help="最高买入价, 超过跳过 (默认0.85, 0.85+PnL下降)")
     parser.add_argument("--phase", default="mid",
@@ -2462,8 +2477,8 @@ def main():
         reprice_gap=args.reprice_gap,
         assets=assets,
         phase_filter=args.phase,
-        min_elapsed=args.min_elapsed,
-        max_elapsed=args.max_elapsed,
+        min_elapsed_pct=args.min_elapsed,
+        max_elapsed_pct=args.max_elapsed,
         max_buy_price=args.max_buy_price,
         sl_trigger=args.sl_trigger,
         sl_confirm=args.sl_confirm,

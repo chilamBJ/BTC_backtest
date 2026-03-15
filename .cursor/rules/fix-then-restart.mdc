@@ -1,0 +1,31 @@
+---
+description: 修复后自动重启/部署，无需用户手动执行
+alwaysApply: true
+---
+
+# 修复后自动完成重启与部署
+
+**原则**：修复程序后，由 AI 自动执行相关的重启或部署动作，无需每次都让用户手动做一遍。
+
+## 适用场景
+
+当修改了以下任一方向时，修复完成后应**自动**执行对应动作：
+
+| 修改范围 | 自动执行动作 |
+|----------|----------------|
+| **采集器**（collector/、run_collector.py） | 部署到云端并重启：`bash scripts/deploy_to_ecs.sh`（或先 deploy 再 `bash scripts/ssh_remote.sh "systemctl restart btc-collector"`） |
+| **Trade 策略或 Dashboard**（trade/、scripts/run_trade.py） | 全量部署到云端：`bash scripts/deploy_full_to_ecs.sh`；若仅改 Dashboard，部署后重启 Dashboard：`bash scripts/ssh_remote.sh "pkill -f 'run_trade.py dashboard'; cd /root/btc_collector && source venv/bin/activate && nohup python3 scripts/run_trade.py dashboard --port 8080 >> dashboard.log 2>&1 &"` |
+| **仅 Dashboard 前端/接口**（trade/tools/web_dashboard.py） | 部署全量后重启 Dashboard 进程（同上） |
+| **云端 MySQL 或环境**（scripts/remote_mysql_setup.sh、deploy 脚本等） | 若涉及云端状态，按需执行 `remote_mysql_setup.sh` 或 `deploy_full_to_ecs.sh` |
+
+## 执行要求
+
+- 在当轮对话中完成修复后，**同一轮内**执行上述部署/重启命令（需 network 权限时说明并请求）。
+- 执行结果简要反馈给用户（成功/失败、关键日志一行）。
+- 若用户明确说「只改代码不要动云端」，则跳过自动部署/重启。
+- 若同一问题连续尝试修复 **3 次仍未解决**，下一轮起应主动切换到更高能力模型继续排查，并在回复中明确告知已升级排查策略。
+
+## 例外
+
+- 仅修改文档、README、.gitignore 等与运行无关内容时，不触发部署或重启。
+- 仅本地运行的工具（如 backtest、本地脚本）修复后，无需部署云端。

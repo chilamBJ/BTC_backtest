@@ -9,7 +9,7 @@
   python scripts/run_trade.py seller --duration 2h
   python scripts/run_trade.py smart_seller --duration 2h
   python scripts/run_trade.py model_seller --duration 2h
-  python scripts/run_trade.py paper_bot_v2  # Binance 时钟驱动模拟盘
+  python scripts/run_trade.py paper_bot_v2 --model data/models/model_seller.pkl  # Binance 时钟驱动模拟盘（写入 MySQL）
 
   # 实盘 (需在 .env 中配置 PRIVATE_KEY、PROXY_ADDRESS 等)
   python scripts/run_trade.py seller --live --amount 2 --duration 4h
