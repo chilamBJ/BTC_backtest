@@ -8,3 +8,11 @@ shap>=0.43.0
 # data_collector 依赖
 aiohttp>=3.9.0
 python-telegram-bot>=21.0
+# sync_parquet_from_ecs 依赖
+pexpect>=4.8.0
+# trade 策略与 Dashboard（seller / smart_seller）
+pymysql>=1.1.0
+DBUtils>=3.0.0
+python-dotenv>=0.20.0
+py-clob-client>=0.34.0
+httpx>=0.24.0

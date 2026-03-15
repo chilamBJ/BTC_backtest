@@ -1,0 +1,52 @@
+---
+description: 云端部署与代码同步规则
+alwaysApply: true
+---
+
+# 云端部署与代码同步
+
+采集器部署在香港 ECS，使用 systemd 管理。**本地为代码源，云端通过部署脚本同步。**
+
+## 原则
+
+保持本地、云端、Git 三者一致。推荐流程：**本地修改 → 部署到云端验证 → 提交并推送到 Git**。
+
+## 部署到云端
+
+在 `.env` 中配置后直接运行（无需每次输入密码）：
+
+```bash
+bash scripts/deploy_to_ecs.sh
+```
+
+`.env` 需包含：DEPLOY_PASSWORD、TELEGRAM_BOT_TOKEN、ADMIN_CHAT_ID。可复制 `.env.example` 填写。
+
+## 代码同步流程
+
+| 操作 | 命令 |
+|------|------|
+| 本地改代码 | 正常编辑 |
+| 同步到云端 | `bash scripts/deploy_to_ecs.sh` |
+| 提交到 Git | `git add -A && git commit -m "..." && git push` |
+
+## 云端管理
+
+使用 `scripts/ssh_remote.sh` 从 .env 读取密码执行（无需交互输入）：
+
+```bash
+bash scripts/ssh_remote.sh "systemctl status btc-collector"
+bash scripts/ssh_remote.sh "tail -f /root/btc_collector/collector.log"
+bash scripts/ssh_remote.sh "systemctl restart btc-collector"
+bash scripts/ssh_remote.sh "cd /root/btc_collector && python3 scripts/check_pm_api.py"
+```
+
+## 磁盘空间与 parquet 同步
+
+- **云端**：cron 每日 2:00 运行 disk_monitor.sh，可用 < 10GB 时 Telegram 通知
+- **本地**：`python scripts/sync_parquet_from_ecs.py` 拉取完整 parquet 并删除云端（从 .env 读取配置）
+- 仅同步昨日及更早文件；校验大小一致后才删除云端
+
+## 注意
+
+- 敏感信息（密码、token）通过环境变量传入，勿提交到 git
+- 修改采集器相关代码后，应部署到云端验证，再提交 git

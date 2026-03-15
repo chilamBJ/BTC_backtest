@@ -34,6 +34,7 @@ PM_TRADES_POLL_INTERVAL = 10
 PM_HISTORY_INTERVAL = 300  # 5 分钟
 PM_ORDERBOOK_LOW_FREQ = 60
 PM_ORDERBOOK_HIGH_FREQ_LAST_SEC = 30  # K 线最后 30 秒改为每秒
+PM_MIDPOINT_INTERVAL = 1  # 实时价格采集间隔（秒），与 trade 文件夹一致，使用 CLOB midpoint
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
@@ -49,7 +50,19 @@ start_time: float = 0.0
 last_heal_ts: float | None = None
 today_rows: dict[str, int] = {
     "agg": 0, "force": 0, "depth": 0,
-    "pm_trades": 0, "pm_orderbook": 0, "pm_history": 0,
+    "pm_trades": 0, "pm_midpoint": 0, "pm_orderbook": 0, "pm_history": 0,
+}
+enqueued_rows: dict[str, int] = {
+    "agg": 0, "force": 0, "depth": 0,
+    "pm_trades": 0, "pm_midpoint": 0, "pm_orderbook": 0, "pm_history": 0,
+}
+last_enqueue_ts: dict[str, float | None] = {
+    "agg": None, "force": None, "depth": None,
+    "pm_trades": None, "pm_midpoint": None, "pm_orderbook": None, "pm_history": None,
+}
+last_flush_ts: dict[str, float | None] = {
+    "agg": None, "force": None, "depth": None,
+    "pm_trades": None, "pm_midpoint": None, "pm_orderbook": None, "pm_history": None,
 }
 queues: dict[str, asyncio.Queue] = {}
 alert_sender = None  # 由 main 注入 send_alert 的占位
@@ -57,6 +70,23 @@ alert_sender = None  # 由 main 注入 send_alert 的占位
 # Polymarket 动态市场路由：当前 Active 的 5m/15m 市场（由 pm_market_router 维护）
 # 结构 {'5m': {'condition_id': str, 'token_ids': [yes_id, no_id]}, '15m': {...}}
 active_pm_markets: dict[str, dict[str, Any]] = {}
+
+
+async def enqueue_row(queue_name: str, row: dict[str, Any]) -> bool:
+    """统一入队并记录实时入队计数/时间。"""
+    q = queues.get(queue_name)
+    if not q:
+        return False
+    await q.put(row)
+    enqueued_rows[queue_name] = enqueued_rows.get(queue_name, 0) + 1
+    last_enqueue_ts[queue_name] = time.time()
+    return True
+
+
+def _fmt_ts(ts: float | None) -> str:
+    if not ts:
+        return "从未"
+    return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
 def send_alert_sync(msg: str) -> None:
@@ -114,6 +144,7 @@ async def writer_worker(
                 df = pd.DataFrame(buffer)
                 _parquet_append(path, df, columns)
                 today_rows[row_counter_key] = today_rows.get(row_counter_key, 0) + len(buffer)
+                last_flush_ts[row_counter_key] = time.time()
                 buffer = []
                 last_flush = time.monotonic()
         except asyncio.CancelledError:
@@ -128,6 +159,7 @@ async def writer_worker(
         df = pd.DataFrame(buffer)
         _parquet_append(path, df, columns)
         today_rows[row_counter_key] = today_rows.get(row_counter_key, 0) + len(buffer)
+        last_flush_ts[row_counter_key] = time.time()
     queue.task_done()
 
 
@@ -162,12 +194,11 @@ async def _agg_rest_fill(symbol: str, from_ts_ms: int, to_ts_ms: int) -> None:
             else:
                 by_sec[ts_sec][1] += q
             by_sec[ts_sec][2] += 1
-        q_agg = queues.get("agg")
-        if not q_agg or is_paused:
+        if is_paused:
             return
         for ts_sec in sorted(by_sec.keys()):
             bv, sv, tc = by_sec[ts_sec]
-            await q_agg.put({"ts_sec": ts_sec, "buy_vol": bv, "sell_vol": sv, "trade_count": tc})
+            await enqueue_row("agg", {"ts_sec": ts_sec, "buy_vol": bv, "sell_vol": sv, "trade_count": tc})
         last_heal_ts = time.time()
         if alert_sender:
             await alert_sender("🔧 REST 自愈已执行：aggTrade 缺失区间已补齐")
@@ -217,8 +248,8 @@ async def producer_agg() -> None:
                                     buf[s] = [0.0, 0.0, 0]
                             for s in range(last_ts_sec, ts_sec):
                                 row = buf.pop(s, None)
-                                if row and queues.get("agg"):
-                                    await queues["agg"].put({
+                                if row:
+                                    await enqueue_row("agg", {
                                         "ts_sec": s,
                                         "buy_vol": row[0],
                                         "sell_vol": row[1],
@@ -269,8 +300,7 @@ async def producer_force() -> None:
                         qty = float(o.get("q", o.get("Q", 0)))
                         price = float(o.get("p", o.get("P", 0)))
                         symbol = o.get("s", "")
-                        if queues.get("force"):
-                            await queues["force"].put({
+                        await enqueue_row("force", {
                                 "ts": ts,
                                 "side": str(side),
                                 "qty": qty,
@@ -336,8 +366,8 @@ async def producer_depth() -> None:
                         _l2_bids = sorted(bids, key=lambda x: -x[0])[:10]
                         _l2_asks = sorted(asks, key=lambda x: x[0])[:10]
                         now = int(time.time())
-                        if now >= next_sec and queues.get("depth") and not is_paused:
-                            await queues["depth"].put(snapshot_row(next_sec - 1))
+                        if now >= next_sec and not is_paused:
+                            await enqueue_row("depth", snapshot_row(next_sec - 1))
                             next_sec = now + 1
         except asyncio.CancelledError:
             break
@@ -352,6 +382,7 @@ async def producer_depth() -> None:
 # 4. Polymarket V2：动态路由 + 逐笔提纯 + 双轨订单簿 + 历史基准
 # ---------------------------------------------------------------------------
 PM_TRADES_COLUMNS = ["timestamp", "price", "size", "side", "outcome", "conditionId", "market_type"]
+PM_MIDPOINT_COLUMNS = ["ts_utc", "market_type", "bar_sec", "yes_mid", "no_mid", "spread"]
 PM_ORDERBOOK_COLUMNS = [
     "ts_utc", "market_type", "bar_sec",
     "yes_bid_1", "yes_ask_1", "yes_bid_size_1", "yes_ask_size_1",
@@ -379,63 +410,137 @@ def _gamma_parse_token_ids(raw: Any) -> list[str]:
     return []
 
 
+def _market_text(m: dict) -> str:
+    """拼接市场名称相关字段（用于匹配）。"""
+    return " ".join(
+        str(x or "") for x in [
+            m.get("question"),
+            m.get("slug"),
+            m.get("title"),
+        ]
+    ).lower()
+
+
 def _is_btc_5m_market(m: dict) -> bool:
-    """判断是否为当前可用的 BTC 5 分钟市场。"""
-    q = (m.get("question") or m.get("slug") or "").lower()
-    return "btc" in q and "5" in q and "min" in q
+    """判断是否为当前可用的 BTC 5 分钟市场。兼容 5m / 5 m / 5-m / 5min 等写法。"""
+    q = _market_text(m)
+    has_btc = "btc" in q or "bitcoin" in q
+    has_5m = any(p in q for p in ("5m", "5 m", "5-m", "5min", "5 min"))
+    return has_btc and has_5m
 
 
 def _is_btc_15m_market(m: dict) -> bool:
-    """判断是否为当前可用的 BTC 15 分钟市场。"""
-    q = (m.get("question") or m.get("slug") or "").lower()
-    return "btc" in q and "15" in q and "min" in q
+    """判断是否为当前可用的 BTC 15 分钟市场。兼容 15m / 15 m / 15-m / 15min 等写法。"""
+    q = _market_text(m)
+    has_btc = "btc" in q or "bitcoin" in q
+    has_15m = any(p in q for p in ("15m", "15 m", "15-m", "15min", "15 min"))
+    return has_btc and has_15m
 
 
 async def pm_market_router() -> None:
     """
-    动态市场路由：每 PM_MARKET_ROUTER_INTERVAL 秒通过 Gamma API 拉取 Active 的 BTC 5m/15m 市场，
-    更新 active_pm_markets；ID 变化时底层轮询逻辑自动使用新 ID（无需显式取消订阅）。
+    动态市场路由：每 PM_MARKET_ROUTER_INTERVAL 秒通过 Gamma API 拉取当前 BTC 5m/15m 市场。
+    使用 Events API + 计算 slug（btc-updown-5m-{ts} / btc-updown-15m-{ts}），
+    因 Polymarket 的 5m/15m 市场不出现在 /markets 列表中。
     """
     global active_pm_markets
     import aiohttp
-    url = f"{PM_GAMMA_URL}/markets"
+    events_url = f"{PM_GAMMA_URL}/events"
+    fail_count = 0
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; BTCCollector/1.0)"}
+    timeout = aiohttp.ClientTimeout(total=15, connect=8)
     while not shutdown_event.is_set():
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params={"closed": "false", "active": "true", "limit": 200}) as resp:
-                    if resp.status != 200:
-                        await asyncio.sleep(PM_MARKET_ROUTER_INTERVAL)
-                        continue
-                    data = await resp.json()
-            if not isinstance(data, list):
-                await asyncio.sleep(PM_MARKET_ROUTER_INTERVAL)
-                continue
             new_5m = None
             new_15m = None
-            for m in data:
-                cid = m.get("conditionId") or m.get("condition_id")
-                tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
-                if not cid or len(tokens) < 2:
-                    continue
-                if _is_btc_5m_market(m):
-                    new_5m = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
-                elif _is_btc_15m_market(m):
-                    new_15m = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
+            last_err = None
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                now_ts = int(time.time())
+                base_5 = (now_ts // 300) * 300
+                base_15 = (now_ts // 900) * 900
+                for slug_prefix, base, window in [
+                    ("btc-updown-5m", base_5, 300),
+                    ("btc-updown-15m", base_15, 900),
+                ]:
+                    for offset in (0, -window, window, -2 * window, 2 * window):
+                        ts = base + offset
+                        slug = f"{slug_prefix}-{ts}"
+                        try:
+                            async with session.get(events_url, params={"slug": slug}) as resp:
+                                if resp.status != 200:
+                                    last_err = f"HTTP {resp.status}"
+                                    continue
+                                data = await resp.json()
+                        except Exception as ex:
+                            last_err = str(ex)[:80]
+                            continue
+                        events = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
+                        if not isinstance(events, list) or not events:
+                            last_err = "empty"
+                            continue
+                        e = events[0]
+                        markets = e.get("markets") or []
+                        if not markets:
+                            last_err = "no markets"
+                            continue
+                        m = markets[0]
+                        cid = m.get("conditionId") or m.get("condition_id")
+                        tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
+                        if cid and len(tokens) >= 2:
+                            info = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
+                            if "5m" in slug_prefix:
+                                new_5m = info
+                            else:
+                                new_15m = info
+                            break
+            if new_5m and not new_15m:
+                async with aiohttp.ClientSession(headers=headers, timeout=timeout) as retry_session:
+                    for offset in (0, -900, 900, -1800, 1800):
+                        ts = base_15 + offset
+                        slug = f"btc-updown-15m-{ts}"
+                        try:
+                            async with retry_session.get(events_url, params={"slug": slug}) as resp:
+                                if resp.status != 200:
+                                    continue
+                                data = await resp.json()
+                        except Exception:
+                            continue
+                        events = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
+                        if isinstance(events, list) and events and events[0].get("markets"):
+                            m = events[0]["markets"][0]
+                            cid = m.get("conditionId") or m.get("condition_id")
+                            tokens = _gamma_parse_token_ids(m.get("clobTokenIds") or m.get("clob_token_ids"))
+                            if cid and len(tokens) >= 2:
+                                new_15m = {"condition_id": cid, "token_ids": [tokens[0], tokens[1]]}
+                                break
             prev_5m = active_pm_markets.get("5m", {}).get("condition_id")
             prev_15m = active_pm_markets.get("15m", {}).get("condition_id")
             updated = {}
             if new_5m:
                 updated["5m"] = new_5m
+                fail_count = 0
             if new_15m:
                 updated["15m"] = new_15m
+                fail_count = 0
             if updated:
                 active_pm_markets.update(updated)
+                if not prev_5m and not prev_15m:
+                    print(f"[PM Router] 首次获取成功: 5m={bool(new_5m)} 15m={bool(new_15m)}")
             if (new_5m and new_5m["condition_id"] != prev_5m) or (new_15m and new_15m["condition_id"] != prev_15m):
                 if alert_sender:
                     await alert_sender("🔄 PM 路由更新：检测到 5m/15m 市场切换，已更新 active_pm_markets")
+            if not updated:
+                fail_count += 1
+                if fail_count >= 3 and alert_sender:
+                    await alert_sender(
+                        f"⚠️ PM 路由连续 {fail_count} 次失败，5m/15m 仍为 N/A。"
+                        f"最后错误: {last_err or 'unknown'}。请检查云端能否访问 gamma-api.polymarket.com"
+                    )
+                    fail_count = 0
         except asyncio.CancelledError:
             break
         except Exception as e:
+            fail_count += 1
             if alert_sender:
                 await alert_sender(f"⚠️ PM 市场路由异常: {e}")
         await asyncio.sleep(PM_MARKET_ROUTER_INTERVAL)
@@ -492,13 +597,79 @@ async def pm_trades_poller() -> None:
                         t = dict(t)
                         t["outcome"] = "Yes" if str(t["asset"]) == str(token_ids[0]) else "No"
                     row = _purify_trade(t, market_type)
-                    await q.put(row)
+                    await enqueue_row("pm_trades", row)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 if alert_sender:
                     await alert_sender(f"⚠️ PM Trades 拉取异常 ({market_type}): {e}")
         await asyncio.sleep(PM_TRADES_POLL_INTERVAL)
+
+
+async def pm_midpoint_poller() -> None:
+    """
+    实时价格采集：使用 CLOB midpoint API（与 trade/collect_data_v3、smart_seller_live 一致）。
+    比 orderbook 更高效：1 次请求/市场 vs 2 次，返回 ~20 字节 vs 完整盘口。
+    """
+    import aiohttp
+    while not shutdown_event.is_set():
+        if is_paused:
+            await asyncio.sleep(PM_MIDPOINT_INTERVAL)
+            continue
+        q = queues.get("pm_midpoint")
+        if not q:
+            await asyncio.sleep(PM_MIDPOINT_INTERVAL)
+            continue
+        now = time.time()
+        now_sec = int(now)
+        bar_5m = now_sec % 300
+        bar_15m = now_sec % 900
+        items = [
+            (mt, info) for mt, info in list(active_pm_markets.items())
+            if info.get("token_ids")
+        ]
+        if not items:
+            await asyncio.sleep(PM_MIDPOINT_INTERVAL)
+            continue
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async def fetch_one(market_type: str, token_ids: list):
+                yes_mid = None
+                try:
+                    async with session.get(
+                        f"{PM_CLOB_URL}/midpoint",
+                        params={"token_id": token_ids[0]},
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            mid = float(data.get("mid", 0))
+                            if 0 < mid < 1:
+                                yes_mid = mid
+                except Exception:
+                    pass
+                return market_type, yes_mid
+
+            results = await asyncio.gather(
+                *[fetch_one(mt, info["token_ids"]) for mt, info in items],
+                return_exceptions=True,
+            )
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            market_type, yes_mid = r
+            if yes_mid is None:
+                continue
+            no_mid = round(1.0 - yes_mid, 6)
+            spread = round(abs(yes_mid - no_mid), 4)
+            bar_sec = bar_5m if market_type == "5m" else bar_15m
+            await enqueue_row("pm_midpoint", {
+                "ts_utc": now_sec,
+                "market_type": market_type,
+                "bar_sec": bar_sec,
+                "yes_mid": yes_mid,
+                "no_mid": no_mid,
+                "spread": spread,
+            })
+        await asyncio.sleep(PM_MIDPOINT_INTERVAL)
 
 
 def _top3_levels(levels: list) -> list[tuple[float, float]]:
@@ -588,8 +759,8 @@ async def pm_orderbook_dual_track() -> None:
                 continue
             bar_sec = bar_5m if market_type == "5m" else bar_15m
             row = await pm_orderbook_snapshot(market_type, token_ids, int(now), bar_sec)
-            if row and q:
-                await q.put(row)
+            if row:
+                await enqueue_row("pm_orderbook", row)
         await asyncio.sleep(interval)
 
 
@@ -620,7 +791,7 @@ async def pm_history_poller() -> None:
                         data = await resp.json()
                 history = data.get("history", [])
                 for h in history:
-                    await q.put({
+                    await enqueue_row("pm_history", {
                         "t": int(h.get("t", 0)),
                         "p": float(h.get("p", 0)),
                         "market_type": market_type,
@@ -682,17 +853,32 @@ async def run_telegram_bot() -> tuple[asyncio.Task | None, object]:
             f"PM 5m: cond={pm_5m.get('condition_id', 'N/A')[:16]}… tokens={len(pm_5m.get('token_ids', []))}\n"
             f"PM 15m: cond={pm_15m.get('condition_id', 'N/A')[:16]}… tokens={len(pm_15m.get('token_ids', []))}"
         )
+        enq_text = (
+            f"agg={enqueued_rows.get('agg',0)} force={enqueued_rows.get('force',0)} depth={enqueued_rows.get('depth',0)} "
+            f"pm_trades={enqueued_rows.get('pm_trades',0)} pm_mid={enqueued_rows.get('pm_midpoint',0)} "
+            f"pm_ob={enqueued_rows.get('pm_orderbook',0)} pm_hist={enqueued_rows.get('pm_history',0)}"
+        )
+        flush_text = (
+            f"agg={_fmt_ts(last_flush_ts.get('agg'))} force={_fmt_ts(last_flush_ts.get('force'))} depth={_fmt_ts(last_flush_ts.get('depth'))} "
+            f"pm_trades={_fmt_ts(last_flush_ts.get('pm_trades'))} pm_mid={_fmt_ts(last_flush_ts.get('pm_midpoint'))} "
+            f"pm_ob={_fmt_ts(last_flush_ts.get('pm_orderbook'))} pm_hist={_fmt_ts(last_flush_ts.get('pm_history'))}"
+        )
         text = (
             "📊 采集器状态\n"
             f"运行时间: {uptime/3600:.2f} 小时\n"
             f"今日行数: agg={today_rows.get('agg',0)} force={today_rows.get('force',0)} depth={today_rows.get('depth',0)} "
-            f"pm_trades={today_rows.get('pm_trades',0)} pm_ob={today_rows.get('pm_orderbook',0)} pm_hist={today_rows.get('pm_history',0)}\n"
+            f"pm_trades={today_rows.get('pm_trades',0)} pm_mid={today_rows.get('pm_midpoint',0)} pm_ob={today_rows.get('pm_orderbook',0)} pm_hist={today_rows.get('pm_history',0)}\n"
+            f"实时入队: {enq_text}\n"
+            f"最近落盘: {flush_text}\n"
             f"Queue 积压: {q_sizes}\n"
             f"最近自愈: {heal_str}\n"
             f"暂停: {is_paused}\n"
             f"---\n{pm_status}"
         )
-        await update.message.reply_text(text)
+        try:
+            await update.message.reply_text(text)
+        except Exception:
+            pass
 
     async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         global is_paused
@@ -735,27 +921,30 @@ async def main() -> None:
         "force": asyncio.Queue(maxsize=50_000),
         "depth": asyncio.Queue(maxsize=50_000),
         "pm_trades": asyncio.Queue(maxsize=50_000),
+        "pm_midpoint": asyncio.Queue(maxsize=50_000),
         "pm_orderbook": asyncio.Queue(maxsize=20_000),
         "pm_history": asyncio.Queue(maxsize=10_000),
     }
 
-    # 启动 6 个 Writer（Binance 3 + PM 3）
+    # 启动 7 个 Writer（Binance 3 + PM 4）
     writers = [
         asyncio.create_task(writer_worker("agg", queues["agg"], "btc_1s", AGG_COLUMNS, "agg")),
         asyncio.create_task(writer_worker("force", queues["force"], "btc_force", FORCE_COLUMNS, "force")),
         asyncio.create_task(writer_worker("depth", queues["depth"], "btc_depth", DEPTH_COLUMNS, "depth")),
         asyncio.create_task(writer_worker("pm_trades", queues["pm_trades"], "pm_trades", PM_TRADES_COLUMNS, "pm_trades")),
+        asyncio.create_task(writer_worker("pm_midpoint", queues["pm_midpoint"], "pm_midpoint", PM_MIDPOINT_COLUMNS, "pm_midpoint")),
         asyncio.create_task(writer_worker("pm_orderbook", queues["pm_orderbook"], "pm_orderbook", PM_ORDERBOOK_COLUMNS, "pm_orderbook")),
         asyncio.create_task(writer_worker("pm_history", queues["pm_history"], "pm_history", PM_HISTORY_COLUMNS, "pm_history")),
     ]
 
-    # 启动 Producer：Binance 3 + PM 路由 + PM 逐笔 + PM 双轨订单簿 + PM 历史
+    # 启动 Producer：Binance 3 + PM 路由 + PM 逐笔 + PM midpoint(实时价) + PM 订单簿 + PM 历史
     producers = [
         asyncio.create_task(producer_agg()),
         asyncio.create_task(producer_force()),
         asyncio.create_task(producer_depth()),
         asyncio.create_task(pm_market_router()),
         asyncio.create_task(pm_trades_poller()),
+        asyncio.create_task(pm_midpoint_poller()),
         asyncio.create_task(pm_orderbook_dual_track()),
         asyncio.create_task(pm_history_poller()),
     ]

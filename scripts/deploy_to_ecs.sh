@@ -1,26 +1,36 @@
 #!/bin/bash
 # 部署数据采集器到香港 ECS
-# 用法: DEPLOY_PASSWORD='xxx' TELEGRAM_BOT_TOKEN='xxx' [ADMIN_CHAT_ID='xxx'] ./deploy_to_ecs.sh
+# 从项目根目录 .env 读取配置，无需每次输入密码
+# 用法: bash scripts/deploy_to_ecs.sh
 
 set -e
-SERVER="47.238.152.210"
-USER="root"
-REMOTE_DIR="/root/btc_collector"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$PROJECT_ROOT"
 
+# 加载 .env（优先环境变量，否则从 .env 读取）
+if [ -f .env ]; then
+  set -a
+  source .env 2>/dev/null || true
+  set +a
+fi
+
+SERVER="${SYNC_ECS_SERVER:-47.238.152.210}"
+USER="${SYNC_ECS_USER:-root}"
+REMOTE_DIR="/root/btc_collector"
 PASSWORD="${DEPLOY_PASSWORD}"
 TG_TOKEN="${TELEGRAM_BOT_TOKEN}"
 ADMIN_CHAT="${ADMIN_CHAT_ID:-}"
 
 if [ -z "$PASSWORD" ] || [ -z "$TG_TOKEN" ]; then
-  echo "请设置: DEPLOY_PASSWORD TELEGRAM_BOT_TOKEN"
+  echo "请在 .env 中配置 DEPLOY_PASSWORD 和 TELEGRAM_BOT_TOKEN"
+  echo "可复制 .env.example 为 .env 并填写"
   exit 1
 fi
 
 echo ">>> 1. 打包待部署文件..."
 cd "$PROJECT_ROOT"
 tar --exclude='__pycache__' --exclude='*.pyc' -czf /tmp/btc_collector_deploy.tar.gz \
-  collector/ run_collector.py requirements.txt scripts/btc-collector.service
+  collector/ run_collector.py requirements.txt scripts/btc-collector.service scripts/disk_monitor.sh scripts/check_pm_api.py
 
 echo ">>> 2. 上传到服务器..."
 expect << EOF
@@ -50,8 +60,8 @@ send "${PASSWORD}\r"
 expect eof
 EOF
 
-echo ">>> 5. 创建 .env 并配置 systemd 服务..."
-REMOTE_CMD="echo 'TELEGRAM_BOT_TOKEN=${TG_TOKEN}' > ${REMOTE_DIR}/.env && echo 'ADMIN_CHAT_ID=${ADMIN_CHAT}' >> ${REMOTE_DIR}/.env && chmod 600 ${REMOTE_DIR}/.env && systemctl daemon-reload && systemctl enable btc-collector && systemctl restart btc-collector"
+echo ">>> 5. 创建 .env、配置 systemd 与磁盘监控 cron..."
+REMOTE_CMD="echo 'TELEGRAM_BOT_TOKEN=${TG_TOKEN}' > ${REMOTE_DIR}/.env && echo 'ADMIN_CHAT_ID=${ADMIN_CHAT}' >> ${REMOTE_DIR}/.env && chmod 600 ${REMOTE_DIR}/.env && chmod +x ${REMOTE_DIR}/scripts/disk_monitor.sh && (crontab -l 2>/dev/null | grep -v disk_monitor.sh; echo '0 2 * * * ${REMOTE_DIR}/scripts/disk_monitor.sh') | crontab - && systemctl daemon-reload && systemctl enable btc-collector && systemctl restart btc-collector"
 expect << EOF
 set timeout 30
 spawn ssh -o StrictHostKeyChecking=no ${USER}@${SERVER} "${REMOTE_CMD}"
