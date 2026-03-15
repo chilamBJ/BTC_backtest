@@ -460,12 +460,10 @@ def main() -> None:
         _shutdown.set()
 
     try:
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, do_shutdown)
-    except (NotImplementedError, OSError):
         signal.signal(signal.SIGINT, lambda *a: do_shutdown())
         signal.signal(signal.SIGTERM, lambda *a: do_shutdown())
+    except (ValueError, OSError):
+        pass
 
     print("Paper Bot V2 启动，按 Binance 5m 第 299 秒驱动...")
     asyncio.run(main_loop(str(model_path), log_path))
