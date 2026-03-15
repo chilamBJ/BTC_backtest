@@ -8,10 +8,13 @@
   # 模拟盘 (dry-run)
   python scripts/run_trade.py seller --duration 2h
   python scripts/run_trade.py smart_seller --duration 2h
+  python scripts/run_trade.py model_seller --duration 2h
+  python scripts/run_trade.py paper_bot_v2  # Binance 时钟驱动模拟盘
 
   # 实盘 (需在 .env 中配置 PRIVATE_KEY、PROXY_ADDRESS 等)
   python scripts/run_trade.py seller --live --amount 2 --duration 4h
   python scripts/run_trade.py smart_seller --live --amount 2 --assets btc,eth
+  python scripts/run_trade.py model_seller --live --amount 2 --market-window both
 
   # Dashboard (需 MySQL 已有 seller/smart_seller 表)
   python scripts/run_trade.py dashboard
@@ -30,6 +33,8 @@ TRADE_DIR = PROJECT_ROOT / "trade"
 SCRIPT_MAP = {
     "seller": TRADE_DIR / "strategies" / "seller" / "seller_live.py",
     "smart_seller": TRADE_DIR / "strategies" / "smart_seller" / "smart_seller_live.py",
+    "model_seller": TRADE_DIR / "strategies" / "model_seller" / "model_seller_live.py",
+    "paper_bot_v2": TRADE_DIR / "strategies" / "model_seller" / "paper_bot_v2.py",
     "dashboard": TRADE_DIR / "tools" / "web_dashboard.py",
 }
 
@@ -47,14 +52,14 @@ def main():
 
     if len(sys.argv) < 2:
         print(__doc__)
-        print("可用命令: seller | smart_seller | dashboard")
+        print("可用命令: seller | smart_seller | model_seller | dashboard")
         sys.exit(1)
 
     cmd_name = sys.argv[1].strip().lower()
     script = SCRIPT_MAP.get(cmd_name)
     if not script:
         print(f"未知命令: {cmd_name}", file=sys.stderr)
-        print("可用: seller, smart_seller, dashboard", file=sys.stderr)
+        print("可用: seller, smart_seller, model_seller, paper_bot_v2, dashboard", file=sys.stderr)
         sys.exit(1)
     if not script.exists():
         print(f"脚本不存在: {script}", file=sys.stderr)
@@ -70,4 +75,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已停止 (Ctrl+C)")
+        sys.exit(130)

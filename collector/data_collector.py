@@ -11,6 +11,7 @@ import json
 import os
 import signal
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,9 @@ DATA_DIR = Path(os.environ.get("COLLECTOR_DATA_DIR", "./collector_data"))
 BINANCE_AGG_WS = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 BINANCE_FORCE_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
 BINANCE_DEPTH_WS = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
+BINANCE_KLINE_5M_WS = "wss://stream.binance.com:9443/ws/btcusdt@kline_5m"
 BINANCE_AGG_REST = "https://api.binance.com/api/v3/aggTrades"
+BINANCE_KLINE_REST = "https://api.binance.com/api/v3/klines"
 
 # Polymarket V2
 PM_GAMMA_URL = os.environ.get("PM_GAMMA_URL", "https://gamma-api.polymarket.com")
@@ -49,19 +52,19 @@ shutdown_event = asyncio.Event()
 start_time: float = 0.0
 last_heal_ts: float | None = None
 today_rows: dict[str, int] = {
-    "agg": 0, "force": 0, "depth": 0,
+    "agg": 0, "force": 0, "depth": 0, "binance_5m": 0,
     "pm_trades": 0, "pm_midpoint": 0, "pm_orderbook": 0, "pm_history": 0,
 }
 enqueued_rows: dict[str, int] = {
-    "agg": 0, "force": 0, "depth": 0,
+    "agg": 0, "force": 0, "depth": 0, "binance_5m": 0,
     "pm_trades": 0, "pm_midpoint": 0, "pm_orderbook": 0, "pm_history": 0,
 }
 last_enqueue_ts: dict[str, float | None] = {
-    "agg": None, "force": None, "depth": None,
+    "agg": None, "force": None, "depth": None, "binance_5m": None,
     "pm_trades": None, "pm_midpoint": None, "pm_orderbook": None, "pm_history": None,
 }
 last_flush_ts: dict[str, float | None] = {
-    "agg": None, "force": None, "depth": None,
+    "agg": None, "force": None, "depth": None, "binance_5m": None,
     "pm_trades": None, "pm_midpoint": None, "pm_orderbook": None, "pm_history": None,
 }
 queues: dict[str, asyncio.Queue] = {}
@@ -281,6 +284,79 @@ async def producer_agg() -> None:
 # 2. Binance forceOrder：强平事件
 # ---------------------------------------------------------------------------
 FORCE_COLUMNS = ["ts", "side", "qty", "price", "symbol"]
+
+
+# ---------------------------------------------------------------------------
+# 2b. Binance 5m K 线：宏观环境 + feat_5 / vol_regime
+# ---------------------------------------------------------------------------
+BINANCE_5M_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+_binance_5m_history: deque = deque(maxlen=288)  # 近期 5m K 线（24h），供实盘 feat_5 / vol_regime
+
+
+async def _prewarm_binance_5m() -> None:
+    """启动时拉取过去 24 小时 5m K 线，填充 _binance_5m_history。"""
+    global _binance_5m_history
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                BINANCE_KLINE_REST,
+                params={"symbol": "BTCUSDT", "interval": "5m", "limit": 288},
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+        _binance_5m_history.clear()
+        for bar in data:
+            ts_ms, o, h, l, c, v = bar[0], float(bar[1]), float(bar[2]), float(bar[3]), float(bar[4]), float(bar[5])
+            _binance_5m_history.append({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c, "volume": v})
+        if alert_sender:
+            await alert_sender(f"🔧 Binance 5m 预热完成，加载 {len(_binance_5m_history)} 根 K 线")
+    except Exception as e:
+        if alert_sender:
+            await alert_sender(f"⚠️ Binance 5m 预热失败: {e}")
+
+
+async def producer_binance_5m() -> None:
+    """订阅 kline_5m，仅在 x=True（收盘）时落盘并更新 deque。"""
+    global _binance_5m_history
+    reconnect_count = 0
+    prewarm_done = False
+    while not shutdown_event.is_set():
+        try:
+            if not prewarm_done:
+                await _prewarm_binance_5m()
+                prewarm_done = True
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(BINANCE_KLINE_5M_WS) as ws:
+                    if reconnect_count > 0 and alert_sender:
+                        await alert_sender("🟢 Binance 5m K 线 WebSocket 已重连")
+                    reconnect_count += 1
+                    async for raw in ws:
+                        if shutdown_event.is_set() or is_paused:
+                            continue
+                        msg = json.loads(raw.data)
+                        k = msg.get("k")
+                        if not k or not k.get("x"):
+                            continue
+                        row = {
+                            "timestamp": int(k["t"]),
+                            "open": float(k["o"]),
+                            "high": float(k["h"]),
+                            "low": float(k["l"]),
+                            "close": float(k["c"]),
+                            "volume": float(k["v"]),
+                        }
+                        await enqueue_row("binance_5m", row)
+                        _binance_5m_history.append(row)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            if alert_sender:
+                await alert_sender(f"⚠️ Binance 5m K 线 WebSocket 异常: {e}")
+        if not shutdown_event.is_set():
+            await asyncio.sleep(5)
 
 
 async def producer_force() -> None:
@@ -854,7 +930,7 @@ async def run_telegram_bot() -> tuple[asyncio.Task | None, object]:
             f"PM 15m: cond={pm_15m.get('condition_id', 'N/A')[:16]}… tokens={len(pm_15m.get('token_ids', []))}"
         )
         enq_text = (
-            f"agg={enqueued_rows.get('agg',0)} force={enqueued_rows.get('force',0)} depth={enqueued_rows.get('depth',0)} "
+            f"agg={enqueued_rows.get('agg',0)} force={enqueued_rows.get('force',0)} depth={enqueued_rows.get('depth',0)} 5m={enqueued_rows.get('binance_5m',0)} "
             f"pm_trades={enqueued_rows.get('pm_trades',0)} pm_mid={enqueued_rows.get('pm_midpoint',0)} "
             f"pm_ob={enqueued_rows.get('pm_orderbook',0)} pm_hist={enqueued_rows.get('pm_history',0)}"
         )
@@ -866,7 +942,7 @@ async def run_telegram_bot() -> tuple[asyncio.Task | None, object]:
         text = (
             "📊 采集器状态\n"
             f"运行时间: {uptime/3600:.2f} 小时\n"
-            f"今日行数: agg={today_rows.get('agg',0)} force={today_rows.get('force',0)} depth={today_rows.get('depth',0)} "
+            f"今日行数: agg={today_rows.get('agg',0)} force={today_rows.get('force',0)} depth={today_rows.get('depth',0)} 5m={today_rows.get('binance_5m',0)} "
             f"pm_trades={today_rows.get('pm_trades',0)} pm_mid={today_rows.get('pm_midpoint',0)} pm_ob={today_rows.get('pm_orderbook',0)} pm_hist={today_rows.get('pm_history',0)}\n"
             f"实时入队: {enq_text}\n"
             f"最近落盘: {flush_text}\n"
@@ -920,28 +996,31 @@ async def main() -> None:
         "agg": asyncio.Queue(maxsize=100_000),
         "force": asyncio.Queue(maxsize=50_000),
         "depth": asyncio.Queue(maxsize=50_000),
+        "binance_5m": asyncio.Queue(maxsize=10_000),
         "pm_trades": asyncio.Queue(maxsize=50_000),
         "pm_midpoint": asyncio.Queue(maxsize=50_000),
         "pm_orderbook": asyncio.Queue(maxsize=20_000),
         "pm_history": asyncio.Queue(maxsize=10_000),
     }
 
-    # 启动 7 个 Writer（Binance 3 + PM 4）
+    # 启动 8 个 Writer（Binance 4 + PM 4）
     writers = [
         asyncio.create_task(writer_worker("agg", queues["agg"], "btc_1s", AGG_COLUMNS, "agg")),
         asyncio.create_task(writer_worker("force", queues["force"], "btc_force", FORCE_COLUMNS, "force")),
         asyncio.create_task(writer_worker("depth", queues["depth"], "btc_depth", DEPTH_COLUMNS, "depth")),
+        asyncio.create_task(writer_worker("binance_5m", queues["binance_5m"], "binance_5m", BINANCE_5M_COLUMNS, "binance_5m")),
         asyncio.create_task(writer_worker("pm_trades", queues["pm_trades"], "pm_trades", PM_TRADES_COLUMNS, "pm_trades")),
         asyncio.create_task(writer_worker("pm_midpoint", queues["pm_midpoint"], "pm_midpoint", PM_MIDPOINT_COLUMNS, "pm_midpoint")),
         asyncio.create_task(writer_worker("pm_orderbook", queues["pm_orderbook"], "pm_orderbook", PM_ORDERBOOK_COLUMNS, "pm_orderbook")),
         asyncio.create_task(writer_worker("pm_history", queues["pm_history"], "pm_history", PM_HISTORY_COLUMNS, "pm_history")),
     ]
 
-    # 启动 Producer：Binance 3 + PM 路由 + PM 逐笔 + PM midpoint(实时价) + PM 订单簿 + PM 历史
+    # 启动 Producer：Binance 4 + PM 路由 + PM 逐笔 + PM midpoint(实时价) + PM 订单簿 + PM 历史
     producers = [
         asyncio.create_task(producer_agg()),
         asyncio.create_task(producer_force()),
         asyncio.create_task(producer_depth()),
+        asyncio.create_task(producer_binance_5m()),
         asyncio.create_task(pm_market_router()),
         asyncio.create_task(pm_trades_poller()),
         asyncio.create_task(pm_midpoint_poller()),

@@ -15,6 +15,7 @@
 """
 
 import argparse
+import gzip
 import json
 import os
 import sys
@@ -23,7 +24,10 @@ from datetime import datetime
 try:
     from http.server import ThreadingHTTPServer as HTTPServer
 except ImportError:
+    import socketserver
     from http.server import HTTPServer
+    class HTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -125,7 +129,7 @@ def get_wallet_balance():
 # ============================================================
 
 def get_available_strategies():
-    """返回有数据表的策略列表（本项目仅 seller / smart_seller）"""
+    """返回有数据表的策略列表（本项目支持 seller / smart_seller / model_seller）"""
     strategies = []
     try:
         tables = db_query(None, "SHOW TABLES")
@@ -134,6 +138,8 @@ def get_available_strategies():
             strategies.append('seller')
         if 'smart_seller_trades' in table_names:
             strategies.append('smart_seller')
+        if 'model_seller_trades' in table_names:
+            strategies.append('model_seller')
     except Exception:
         pass
     return strategies
@@ -156,7 +162,16 @@ def get_dashboard_data(strategy="seller", session_id=None):
     all_actions = []
 
     sessions = query_db("SELECT * FROM sessions ORDER BY id")
-    all_sessions.extend(sessions)
+    # 按策略过滤 sessions：只显示该策略有数据的轮次
+    if strategy == 'seller':
+        valid_sids = set(r['session_id'] for r in query_db("SELECT DISTINCT session_id FROM seller_trades WHERE session_id IS NOT NULL"))
+    elif strategy == 'smart_seller':
+        valid_sids = set(r['session_id'] for r in query_db("SELECT DISTINCT session_id FROM smart_seller_trades WHERE session_id IS NOT NULL"))
+    elif strategy == 'model_seller':
+        valid_sids = set(r['session_id'] for r in query_db("SELECT DISTINCT session_id FROM model_seller_trades WHERE session_id IS NOT NULL"))
+    else:
+        valid_sids = {s.get('id') for s in sessions if s.get('id')}
+    all_sessions = [s for s in sessions if s.get('id') in valid_sids]
 
     # session 过滤条件
     sid_filter = ""
@@ -164,6 +179,14 @@ def get_dashboard_data(strategy="seller", session_id=None):
     if session_id is not None and session_id != "all":
         sid_filter = " AND session_id = %s"
         sid_params = (int(session_id),)
+
+    # 全部轮次：seller/smart_seller 按 (session_id, slug) 取最新一条；model_seller 按 slug 去重只显示一条（避免同一市场多轮次重复）
+    all_sessions_filter = (session_id is None or session_id == "all")
+    if strategy == "model_seller":
+        group_by_session_slug = " slug"
+    else:
+        group_by_session_slug = " session_id, slug" if all_sessions_filter else " slug"
+    sid_sub = sid_params + sid_params if sid_params else ()
 
     if strategy == 'seller':
         markets = query_db(f"""
@@ -178,9 +201,9 @@ def get_dashboard_data(strategy="seller", session_id=None):
                    'seller' AS strategy_type,
                    exit_type, exit_price, sl_reason, skip_reason
             FROM seller_trades WHERE status != 'skipped' {sid_filter}
-            AND id IN (SELECT MAX(id) FROM seller_trades WHERE status != 'skipped' {sid_filter} GROUP BY slug)
+            AND id IN (SELECT MAX(id) FROM seller_trades WHERE status != 'skipped' {sid_filter} GROUP BY{group_by_session_slug})
             ORDER BY id
-        """, sid_params + sid_params)
+        """, sid_sub if sid_sub else sid_params + sid_params)
         for m in markets:
             m["entry_confidence"] = m.get("trigger_price")
             m["entry_decision"] = f"sell_{m.get('trigger_side', '').lower()}" if m.get('trigger_side') else None
@@ -199,13 +222,46 @@ def get_dashboard_data(strategy="seller", session_id=None):
                    'smart_seller' AS strategy_type,
                    exit_type, exit_price, sl_reason, skip_reason
             FROM smart_seller_trades WHERE status != 'skipped' {sid_filter}
-            AND id IN (SELECT MAX(id) FROM smart_seller_trades WHERE status != 'skipped' {sid_filter} GROUP BY slug)
+            AND id IN (SELECT MAX(id) FROM smart_seller_trades WHERE status != 'skipped' {sid_filter} GROUP BY{group_by_session_slug})
             ORDER BY id
-        """, sid_params + sid_params)
+        """, sid_sub if sid_sub else sid_params + sid_params)
         for m in markets:
             m["entry_confidence"] = m.get("trigger_price")
             m["entry_decision"] = f"sell_{m.get('trigger_side', '').lower()}" if m.get('trigger_side') else None
             m["entry_momentum"] = None
+        all_markets.extend(markets)
+    elif strategy == 'model_seller':
+        markets = query_db(f"""
+            SELECT id, slug, asset, epoch, question, session_id,
+                   trigger_side, trigger_price, trigger_elapsed, trigger_phase,
+                   buy_side AS entry_side, buy_price AS entry_price,
+                   buy_amount AS entry_amount, buy_shares,
+                   entry_at,
+                   order_id, order_success,
+                   outcome, pnl, settled_at, settle_method,
+                   status, discovered_at,
+                   'model_seller' AS strategy_type,
+                   exit_type, exit_price, sl_reason, skip_reason,
+                   p_yes, feat_1, feat_2, feat_5, market_type, no_trigger_reason
+            FROM model_seller_trades WHERE status != 'skipped' {sid_filter}
+            ORDER BY id
+        """, sid_params)
+        # 按 slug 去重：同一 slug 在 DB 中可能有多条（多轮次多次写入），只保留 id 最大的一条
+        seen = {}
+        for m in markets:
+            slug = (m.get("slug") or "").strip()
+            if not slug:
+                continue
+            mid = m.get("id") or 0
+            if slug not in seen or mid > (seen[slug].get("id") or 0):
+                seen[slug] = m
+        markets = sorted(seen.values(), key=lambda x: (int(x.get("epoch") or 0), x.get("id") or 0))
+        for m in markets:
+            m["entry_confidence"] = m.get("p_yes")
+            m["entry_decision"] = m.get("entry_side")
+            m["entry_momentum"] = None
+            # 未触发原因：仅 model_seller 有，用于排查有 p_yes 但无交易的情况
+            m["no_trigger_reason"] = m.get("no_trigger_reason")
         all_markets.extend(markets)
     actions = query_db(f"""
         SELECT id, ts, market_slug, action, detail, level
@@ -254,18 +310,23 @@ def get_dashboard_data(strategy="seller", session_id=None):
         if m.get("exit_type") == "stop_loss":
             asset_stats[a]["sl"] += 1
 
-    _tbl_map = {'seller': 'seller_trades', 'smart_seller': 'smart_seller_trades'}
+    _tbl_map = {'seller': 'seller_trades', 'smart_seller': 'smart_seller_trades', 'model_seller': 'model_seller_trades'}
     _tbl = _tbl_map.get(strategy)
     if _tbl:
-        _cnt_rows = query_db(
-            f"SELECT COUNT(DISTINCT slug) AS total,"
-            f" COUNT(DISTINCT CASE WHEN status IN ('entered','settled') THEN slug END) AS entered_cnt"
-            f" FROM {_tbl} WHERE 1=1{sid_filter}",
-            sid_params,
-        )
-        _cnt = _cnt_rows[0] if _cnt_rows else {}
-        real_total = int(_cnt.get("total") or 0)
-        real_entered = int(_cnt.get("entered_cnt") or 0)
+        if all_sessions_filter:
+            # 全部轮次：总条数 = 实际返回行数（已按 session_id, slug 去重）
+            real_total = len(all_markets)
+            real_entered = len(entered)
+        else:
+            _cnt_rows = query_db(
+                f"SELECT COUNT(DISTINCT slug) AS total,"
+                f" COUNT(DISTINCT CASE WHEN status IN ('entered','settled') THEN slug END) AS entered_cnt"
+                f" FROM {_tbl} WHERE 1=1{sid_filter}",
+                sid_params,
+            )
+            _cnt = _cnt_rows[0] if _cnt_rows else {}
+            real_total = int(_cnt.get("total") or 0)
+            real_entered = int(_cnt.get("entered_cnt") or 0)
     else:
         real_total = len(all_markets)
         real_entered = len(entered)
@@ -293,7 +354,7 @@ def get_dashboard_data(strategy="seller", session_id=None):
         "asset_stats": {k: {**v, "pnl": round(v["pnl"], 4)} for k, v in asset_stats.items()},
     }
 
-    return {
+    out = {
         "stats": stats,
         "sessions": all_sessions,
         "markets": all_markets,
@@ -302,6 +363,47 @@ def get_dashboard_data(strategy="seller", session_id=None):
         "current_strategy": strategy,
         "current_session": str(session_id) if session_id else "all",
     }
+    if strategy == "model_seller":
+        try:
+            if session_id and str(session_id) != "all":
+                act = query_db(
+                    "SELECT * FROM model_seller_activity WHERE session_id = %s ORDER BY id DESC LIMIT 1",
+                    (int(session_id),),
+                )
+            else:
+                act = query_db("SELECT * FROM model_seller_activity ORDER BY id DESC LIMIT 1")
+            if act:
+                out["model_seller_activity"] = act[0]
+            else:
+                out["model_seller_activity"] = None
+        except Exception:
+            out["model_seller_activity"] = None
+    return out
+
+
+def _sanitize_for_json(obj):
+    """递归清理数据，避免 MySQL 中的控制字符/非法 UTF-8 导致 JSON 解析失败（含「全部轮次」）"""
+    if obj is None:
+        return None
+    if isinstance(obj, bytes):
+        return _sanitize_for_json(obj.decode("utf-8", errors="replace"))
+    if isinstance(obj, str):
+        # JSON 不允许 U+0000～U+001F 的裸控制字符，全部去掉或换成空格
+        result = []
+        for c in obj:
+            if ord(c) <= 0x1F:
+                if c in ("\t", "\n"):
+                    result.append(c)
+                else:
+                    result.append(" ")
+            else:
+                result.append(c)
+        return "".join(result)
+    if isinstance(obj, dict):
+        return {_sanitize_for_json(k) if isinstance(k, str) else k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(x) for x in obj]
+    return obj
 
 
 def _paginate(items, page, per_page):
@@ -409,6 +511,7 @@ tr:hover td { background:rgba(48,54,61,0.3); }
 .act-sl_warning     { background:rgba(210,153,34,0.15); color:var(--yellow); }
 .act-cooldown_start { background:rgba(88,166,255,0.15); color:var(--blue); }
 .act-no_trigger     { background:rgba(139,148,158,0.1); color:var(--text2); }
+.act-ended          { background:rgba(248,81,73,0.2); color:var(--red); }
 
 .st-entered    { color:var(--yellow); }
 .st-settled    { color:var(--green); }
@@ -491,21 +594,21 @@ tr:hover td { background:rgba(48,54,61,0.3); }
       <span id="balanceInfo" style="font-size:13px;color:var(--text2)"></span>
       <div class="strat-tabs" id="stratTabs"></div>
       <select id="sessionSelect" onchange="switchSession()"></select>
-      <span class="refresh-info" id="refreshInfo">每15秒刷新</span>
+      <span class="refresh-info" id="refreshInfo">每5秒刷新</span>
     </div>
   </div>
   <div id="content"><p style="color:var(--text2);padding:40px;text-align:center">加载中...</p></div>
 </div>
 
 <script>
-const RI = 15000;
+const RI = 5000;
 let timer = null;
 let curStrategy = localStorage.getItem('dash_strategy') || 'seller';
 let curSession = localStorage.getItem('dash_session') || 'all';
 let curPage = 1;
-let curPerPage = 30;
+let curPerPage = 12;
 let logPage = 1;
-let logPerPage = 30;
+let logPerPage = 12;
 let _prevSessionIds = '';  // track session list changes
 
 function _saveState() {
@@ -537,14 +640,42 @@ function goLogPage(p) {
   fetchData();
 }
 
+var _fetchRetries = 0;
+var _maxFetchRetries = 5;
+var _retryDelays = [1500, 2500, 4000, 6000, 9000];
 function fetchData() {
-  let url = '/api/data?strategy=' + encodeURIComponent(curStrategy);
+  var url = '/api/data?strategy=' + encodeURIComponent(curStrategy);
   if (curSession && curSession !== 'all') url += '&session=' + encodeURIComponent(curSession);
   url += '&page=' + curPage + '&per_page=' + curPerPage;
   url += '&log_page=' + logPage + '&log_per_page=' + logPerPage;
-  fetch(url).then(r=>r.json()).then(render).catch(e=>{
-    document.getElementById('content').innerHTML = '<p style="color:var(--red);padding:40px">加载失败: '+e+'</p>';
-  });
+  url += '&_=' + (typeof Date.now === 'function' ? Date.now() : new Date().getTime());
+  var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var to = null;
+  if (ctrl) {
+    to = setTimeout(function(){ ctrl.abort(); }, 25000);
+  }
+  fetch(url, { signal: ctrl ? ctrl.signal : undefined, cache: 'no-store' })
+    .then(function(r){
+      if (to) clearTimeout(to);
+      if (!r.ok) return r.text().then(function(t){ throw new Error(t || 'HTTP '+r.status); });
+      return r.json();
+    })
+    .then(function(data){
+      _fetchRetries = 0;
+      render(data);
+    })
+    .catch(function(e){
+      if (to) clearTimeout(to);
+      var msg = (e && (e.message || String(e))) || '网络错误';
+      if (e && e.name === 'AbortError') msg = '请求超时，请重试';
+      else if (msg.indexOf('fetch') !== -1 || msg === 'Failed to fetch') msg = '网络请求失败，请刷新重试';
+      var delay = _retryDelays[_fetchRetries] || 5000;
+      document.getElementById('content').innerHTML = '<p style="color:var(--red);padding:40px">加载失败: '+msg+'<br><small>'+(_fetchRetries < _maxFetchRetries ? delay/1000+' 秒后自动重试 ('+(_fetchRetries+1)+'/'+_maxFetchRetries+')' : '请手动刷新')+'</small></p>';
+      if (_fetchRetries < _maxFetchRetries) {
+        _fetchRetries++;
+        setTimeout(fetchData, delay);
+      }
+    });
 }
 
 const pc = v => v>0?'positive':v<0?'negative':'neutral';
@@ -552,7 +683,58 @@ const fp = v => v==null?'-':(v>0?'+':'')+v.toFixed(4);
 const fpr = v => v==null?'-':v.toFixed(3);
 const fpct = v => v==null?'-':v.toFixed(1)+'%';
 const ft = t => t?t.replace('T',' ').substring(0,19):'-';
-function ss(s) { return s?s.replace(/btc-updown-15m-/,'btc-').replace(/eth-updown-15m-/,'eth-').replace(/sol-updown-15m-/,'sol-').replace(/xrp-updown-15m-/,'xrp-'):'-'; }
+function ss(s) {
+  if(!s) return '-';
+  return s.replace(/btc-updown-15m-/g,'btc-').replace(/btc-updown-5m-/g,'btc-')
+    .replace(/eth-updown-15m-/g,'eth-').replace(/eth-updown-5m-/g,'eth-')
+    .replace(/sol-updown-15m-/g,'sol-').replace(/sol-updown-5m-/g,'sol-')
+    .replace(/xrp-updown-15m-/g,'xrp-').replace(/xrp-updown-5m-/g,'xrp-');
+}
+function parseSlug(slug) {
+  if(!slug) return null;
+  const s = String(slug).trim();
+  const parts = s.split('-');
+  const last = (parts[parts.length-1]||'').trim();
+  const epoch = /^\d+$/.test(last) ? parseInt(last,10) : null;
+  const asset = (parts[0]||'').trim().toLowerCase() || 'btc';
+  const win = s.indexOf('-5m-')>=0 ? 300 : 900;
+  return {asset, epoch, win};
+}
+function shortMarketId(slug) {
+  if(!slug) return '-';
+  return String(slug).trim().toLowerCase().replace(/^([a-z]+)-updown-(?:5m|15m)-/, '$1-');
+}
+function marketDisplayName(m) {
+  const p = parseSlug(m.slug);
+  if(!p || p.epoch==null) return '<span class="mono">'+shortMarketId(m.slug||'')+'</span>';
+  const id = p.asset+'-'+p.epoch;
+  const pad = n => String(n).padStart(2,'0');
+  const d1 = new Date(p.epoch*1000), d2 = new Date((p.epoch+p.win)*1000);
+  const tr = ' ['+pad(d1.getDate())+' '+pad(d1.getHours())+':'+pad(d1.getMinutes())+' - '+pad(d2.getHours())+':'+pad(d2.getMinutes())+'] '+(p.win===300?'5m':'15m');
+  return '<span class="mono">'+id+tr+'</span>';
+}
+function remainingTimeHtml(m, mktId) {
+  const p = parseSlug(m.slug);
+  if(!p || p.epoch==null) return '-';
+  return '<span class="remaining-cell mono" data-epoch="'+p.epoch+'" data-window="'+p.win+'" id="rem-'+mktId+'">-</span>';
+}
+function updateRemainingTimes() {
+  const now = Math.floor(Date.now()/1000);
+  document.querySelectorAll('.remaining-cell').forEach(el=>{
+    const epoch = parseInt(el.dataset.epoch,10), win = parseInt(el.dataset.window,10);
+    if(!epoch||!win) return;
+    const end = epoch + win;
+    if(now >= end) {
+      el.innerHTML = '<span class="act act-ended">已结束</span>';
+      el.classList.add('ended');
+    } else {
+      const s = end - now;
+      const mins = Math.floor(s/60), sec = s % 60;
+      el.textContent = mins + 'm ' + sec + 's';
+      el.classList.remove('ended');
+    }
+  });
+}
 function ab(a) { return '<span class="act act-'+(a||'').replace(/ /g,'_')+'">'+(a||'-')+'</span>'; }
 function sb(s) { return '<span class="st-'+(s||'')+'">'+(s||'-')+'</span>'; }
 function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
@@ -654,7 +836,7 @@ function render(data) {
       const o=document.createElement('option');
       o.value=String(sess.id);
       const t=sess.started_at?sess.started_at.replace('T',' ').substring(5,16):'';
-      const m=sess.mode==='live'?'[LIVE]':'[DRY]';
+      const m=((sess.mode||'').toLowerCase()==='live')?'[LIVE]':'[DRY]';
       const p=sess.total_pnl!=null?(sess.total_pnl>=0?'+':'')+Number(sess.total_pnl).toFixed(2):'';
       o.textContent='#'+sess.id+' '+m+' '+t+(p?' ('+p+')':'');
       sel.add(o);
@@ -667,8 +849,12 @@ function render(data) {
   if(!found){ sel.selectedIndex=0; curSession=sel.value; _saveState(); }
   else { curSession=targetSid; }
 
-  const isLive=data.sessions.some(x=>x.mode==='live');
-  const modeBadge=isLive?'<span class="badge badge-live">LIVE</span>':'<span class="badge badge-dry">DRY-RUN</span>';
+  // 徽章按当前选中轮次：单轮次显示该轮次 mode，全部轮次显示「含 LIVE」或「全部 DRY-RUN」
+  const currentSessions = curSession==='all' ? (data.sessions||[]) : (data.sessions||[]).filter(x=>String(x.id)===curSession);
+  const _isLive = function(s){ return (s.mode||'').toLowerCase()==='live'; };
+  const isLive = currentSessions.length>0 && currentSessions.some(_isLive);
+  const modeLabel = currentSessions.length===1 ? (_isLive(currentSessions[0])?'LIVE':'DRY-RUN') : (isLive ? '含 LIVE' : '全部 DRY-RUN');
+  const modeBadge=isLive?'<span class="badge badge-live">'+modeLabel+'</span>':'<span class="badge badge-dry">'+modeLabel+'</span>';
   const maxAbs=data.max_abs_pnl||1;
 
   let h='';
@@ -682,7 +868,7 @@ function render(data) {
       const paramHelp={
         threshold:'低价方入场阈值',min_threshold:'最低阈值下限',bet_amount:'每笔金额($)',
         max_trades:'最大交易数(0=不限)',max_loss:'最大亏损(0=不限)',limit_offset:'限价偏移',
-        reprice_gap:'重挂单价差',assets:'监控资产',phase_filter:'阶段过滤',min_elapsed:'最少等待(秒)',
+        reprice_gap:'重挂单价差',assets:'监控资产',phase_filter:'阶段过滤',min_elapsed:'最少等待(秒)',max_elapsed:'最晚入场(秒)',min_elapsed_pct:'入场窗口开始(%)',max_elapsed_pct:'入场窗口结束(%)',
         sl_trigger:'止损触发价',sl_confirm:'止损确认次数',sl_fast_track:'极端止损价',
         cooldown_losses:'连亏暂停阈值',max_sl_loss:'单笔最大止损比',dry_run:'模拟模式',
         a_trigger:'策略A入场阈值',a_hedge_ceiling:'对冲成本上限',a_time_stop:'持仓超时(秒)',
@@ -723,6 +909,35 @@ function render(data) {
   h+=statCard('ROI',fpct(s.roi),'',pc(s.roi));
   h+='</div>';
 
+  // 模型策略运行状态与决策（仅 model_seller）
+  if(data.current_strategy==='model_seller' && data.model_seller_activity){
+    const a=data.model_seller_activity;
+    const ts=a.ts?(new Date(a.ts).toLocaleTimeString('zh-CN',{hour12:false})):'';
+    h+='<div class="section" style="margin-top:12px"><div class="section-header"><span class="section-title">\uD83D\uDD04 模型策略运行状态</span><span class="section-count">'+ts+' 更新</span></div>';
+    h+='<div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">';
+    h+=statCard('监控市场',a.markets_watching!=null?a.markets_watching:'-','当前在监');
+    h+=statCard('本轮检查',a.slugs_checked!=null?a.slugs_checked:'-','个 slug');
+    h+=statCard('本轮新发现',a.discovery_found!=null?a.discovery_found:'-','个市场');
+    h+='</div>';
+    let dec=a.decisions_summary;
+    if(dec && typeof dec==='string') try{ dec=JSON.parse(dec); }catch(e){ dec=[]; }
+    if(dec && Array.isArray(dec) && dec.length>0){
+      h+='<div style="margin-top:10px"><div class="section-title" style="font-size:12px;color:var(--text2)">最近决策</div>';
+      h+='<div class="table-wrap"><table><tr><th>市场 slug</th><th>决策</th><th>P(YES)</th><th>类型</th></tr>';
+      dec.slice(-15).reverse().forEach(d=>{
+        const slug=ss(d.slug)||'-';
+        const decision=(d.decision||'-').replace('buy_yes','买YES').replace('buy_no','买NO').replace('no_signal','无信号');
+        const pYes=d.p_yes!=null?Number(d.p_yes).toFixed(3):'-';
+        const mtype=d.market_type||'-';
+        h+='<tr><td class="mono" style="font-size:11px">'+slug+'</td><td>'+decision+'</td><td class="mono">'+pYes+'</td><td>'+mtype+'</td></tr>';
+      });
+      h+='</table></div></div>';
+    } else {
+      h+='<div style="margin-top:8px;color:var(--text2);font-size:12px">暂无决策记录（发现市场后会在窗口结束前给出决策）</div>';
+    }
+    h+='</div>';
+  }
+
   // Stop-loss analysis panel (seller strategy)
   if(s.sl_count > 0 || s.settle_count > 0) {
     h+='<div class="section"><div class="section-header"><span class="section-title">&#x1F6E1;&#xFE0F; 止损 &amp; 保护分析</span></div>';
@@ -756,13 +971,14 @@ function render(data) {
   const pg=data.pagination||{page:1,per_page:30,total:data.markets.length,total_pages:1};
   h+='<div class="section"><div class="section-header"><span class="section-title">市场记录</span><span class="section-count">共 '+pg.total+' 条 · 第 '+pg.page+'/'+pg.total_pages+' 页</span></div>';
   if(data.markets.length){
-    h+='<div class="table-wrap"><table><tr><th>市场</th><th class="hide-mobile">策略</th><th>状态</th><th>方向</th><th>买入价</th><th class="hide-mobile">金额</th><th class="hide-mobile">触发/信心</th><th>结果</th><th class="hide-mobile">退出</th><th>盈亏</th></tr>';
+    h+='<div class="table-wrap"><table><tr><th>市场</th><th>剩余时间</th><th class="hide-mobile">策略</th><th>状态</th><th>方向</th><th>买入价</th><th class="hide-mobile">金额</th><th class="hide-mobile">触发/信心</th><th class="hide-mobile">未触发原因</th><th>结果</th><th class="hide-mobile">退出</th><th>盈亏</th></tr>';
     data.markets.forEach(m=>{
       const side=m.entry_side?'<span class="'+(m.entry_side==='YES'?'positive':'negative')+'">'+m.entry_side+'</span>':'-';
-      let stName = m.strategy_type==='seller'?'卖方':m.strategy_type==='smart_seller'?'智能卖方':'趋势';
-      let stCls = m.strategy_type==='seller'?'act-settle':m.strategy_type==='smart_seller'?'act-place_order':'act-discover';
+      let stName = m.strategy_type==='seller'?'卖方':m.strategy_type==='smart_seller'?'智能卖方':m.strategy_type==='model_seller'?'模型卖方':'趋势';
+      let stCls = m.strategy_type==='seller'?'act-settle':m.strategy_type==='smart_seller'?'act-place_order':m.strategy_type==='model_seller'?'act-entry_signal':'act-discover';
       const st='<span class="act '+stCls+'" style="font-size:10px">'+stName+'</span>';
       const conf=(m.strategy_type==='seller'||m.strategy_type==='smart_seller')?(m.trigger_side?'卖'+m.trigger_side+'@'+fpr(m.trigger_price):'-'):(m.entry_confidence!=null?m.entry_confidence.toFixed(3):'-');
+      const noTrig=m.no_trigger_reason?(m.no_trigger_reason==='event_ok_false'?'事件不满足':m.no_trigger_reason==='prob_in_range'?'概率区间':m.no_trigger_reason==='no_model'?'无模型':m.no_trigger_reason):'-';
       // Exit info
       let exitInfo='-';
       if(m.exit_type==='stop_loss'){
@@ -775,7 +991,9 @@ function render(data) {
       } else if(m.skip_reason==='cooldown'){
         exitInfo='<span class="act act-cooldown_start">冷却</span>';
       }
-      h+='<tr><td class="mono">'+ss(m.slug)+'</td><td class="hide-mobile">'+st+'</td><td>'+sb(m.status)+'</td><td>'+side+'</td><td class="mono">'+fpr(m.entry_price)+'</td><td class="hide-mobile mono">'+(m.entry_amount!=null?'$'+m.entry_amount.toFixed(2):'-')+'</td><td class="hide-mobile mono">'+conf+'</td><td>'+(m.outcome||'-')+'</td><td class="hide-mobile">'+exitInfo+'</td><td>'+pnlBar(m.pnl,maxAbs)+'</td></tr>';
+      const mktName = marketDisplayName(m);
+      const remHtml = remainingTimeHtml(m, m.id);
+      h+='<tr><td class="mono">'+mktName+'</td><td class="mono">'+remHtml+'</td><td class="hide-mobile">'+st+'</td><td>'+sb(m.status)+'</td><td>'+side+'</td><td class="mono">'+fpr(m.entry_price)+'</td><td class="hide-mobile mono">'+(m.entry_amount!=null?'$'+m.entry_amount.toFixed(2):'-')+'</td><td class="hide-mobile mono">'+conf+'</td><td class="hide-mobile" title="有p_yes但未下单时显示">'+noTrig+'</td><td>'+(m.outcome||'-')+'</td><td class="hide-mobile">'+exitInfo+'</td><td>'+pnlBar(m.pnl,maxAbs)+'</td></tr>';
     });
     h+='</table></div>';
     // Pagination controls
@@ -793,7 +1011,7 @@ function render(data) {
       h+='<button class="strat-tab'+(pg.page>=pg.total_pages?' disabled':'')+'" onclick="goPage('+(pg.page+1)+')" '+(pg.page>=pg.total_pages?'disabled':'')+' style="'+(pg.page>=pg.total_pages?'opacity:.4;cursor:default':'')+'">&rsaquo; 下一页</button>';
       h+='<button class="strat-tab'+(pg.page>=pg.total_pages?' disabled':'')+'" onclick="goPage('+pg.total_pages+')" '+(pg.page>=pg.total_pages?'disabled':'')+' style="'+(pg.page>=pg.total_pages?'opacity:.4;cursor:default':'')+'">&raquo;</button>';
       h+='<span style="color:var(--text2);font-size:12px;margin-left:8px">每页 <select onchange="curPerPage=+this.value;curPage=1;fetchData()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-size:12px">';
-      [15,30,50,100].forEach(n=>{ h+='<option value="'+n+'"'+(n===pg.per_page?' selected':'')+'>'+n+'</option>'; });
+      [12,15,20,30,50].forEach(n=>{ h+='<option value="'+n+'"'+(n===pg.per_page?' selected':'')+'>'+n+'</option>'; });
       h+='</select> 条</span>';
       h+='</div>';
     }
@@ -825,7 +1043,7 @@ function render(data) {
       h+='<button class="strat-tab'+(lp.page>=lp.total_pages?' disabled':'')+'" onclick="goLogPage('+(lp.page+1)+')" '+(lp.page>=lp.total_pages?'disabled':'')+' style="'+(lp.page>=lp.total_pages?'opacity:.4;cursor:default':'')+'">&rsaquo; 下一页</button>';
       h+='<button class="strat-tab'+(lp.page>=lp.total_pages?' disabled':'')+'" onclick="goLogPage('+lp.total_pages+')" '+(lp.page>=lp.total_pages?'disabled':'')+' style="'+(lp.page>=lp.total_pages?'opacity:.4;cursor:default':'')+'">&raquo;</button>';
       h+='<span style="color:var(--text2);font-size:12px;margin-left:8px">每页 <select onchange="logPerPage=+this.value;logPage=1;fetchData()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-size:12px">';
-      [30,50,100,200].forEach(n=>{ h+='<option value="'+n+'"'+(n===lp.per_page?' selected':'')+'>'+n+'</option>'; });
+      [12,20,30,50,100].forEach(n=>{ h+='<option value="'+n+'"'+(n===lp.per_page?' selected':'')+'>'+n+'</option>'; });
       h+='</select> 条</span>';
       h+='</div>';
     }
@@ -833,12 +1051,13 @@ function render(data) {
   h+='</div>';
 
   document.getElementById('content').innerHTML=h;
-  document.getElementById('refreshInfo').textContent='更新于 '+new Date().toLocaleTimeString()+' · 每15秒刷新';
+  document.getElementById('refreshInfo').textContent='更新于 '+new Date().toLocaleTimeString()+' · 每5秒刷新';
+  updateRemainingTimes();
 }
 
 function updateStratTabs(strategies, active) {
   const c=document.getElementById('stratTabs');
-  const names={seller:'📉 卖方策略',trend:'📈 趋势策略',smart_seller:'🧠 智能卖方'};
+  const names={seller:'📉 卖方策略',trend:'📈 趋势策略',smart_seller:'🧠 智能卖方',model_seller:'🤖 模型卖方'};
   c.innerHTML=strategies.map(s=>
     '<button class="strat-tab'+(s===active?' active':'')+'" onclick="switchStrategy(\''+s+'\')">'+(names[s]||s)+'</button>'
   ).join('');
@@ -864,6 +1083,7 @@ fetchData();
 fetchBalance();
 timer=setInterval(()=>fetchData(),RI);
 setInterval(()=>fetchBalance(),60000);  // 余额每60秒刷新
+setInterval(updateRemainingTimes, 1000);  // 剩余时间每秒更新
 </script>
 </body>
 </html>"""
@@ -897,42 +1117,89 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._respond(200, "text/html", HTML_PAGE.encode("utf-8"))
 
         elif path == "/api/data":
-            qs = parse_qs(parsed.query)
-            strategy = qs.get("strategy", ["seller"])[0]
-            session = qs.get("session", ["all"])[0]
-            sid = None if session == "all" else session
-            page = int(qs.get("page", ["1"])[0])
-            per_page = int(qs.get("per_page", ["30"])[0])
-            log_page = int(qs.get("log_page", ["1"])[0])
-            log_per_page = int(qs.get("log_per_page", ["30"])[0])
-            data = get_dashboard_data(strategy=strategy, session_id=sid)
-            data = paginate_data(data, page=page, per_page=per_page,
-                                log_page=log_page, log_per_page=log_per_page)
-            body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-            self._respond(200, "application/json", body,
-                          extra={"Access-Control-Allow-Origin": "*"})
+            body = None
+            try:
+                qs = parse_qs(parsed.query)
+                strategy = qs.get("strategy", ["seller"])[0]
+                session = qs.get("session", ["all"])[0]
+                sid = None if session == "all" else session
+                page = max(1, int(qs.get("page", ["1"])[0]))
+                per_page = min(20, max(1, int(qs.get("per_page", ["15"])[0])))
+                log_page = max(1, int(qs.get("log_page", ["1"])[0]))
+                log_per_page = min(20, max(1, int(qs.get("log_per_page", ["15"])[0])))
+                data = get_dashboard_data(strategy=strategy, session_id=sid)
+                data = paginate_data(data, page=page, per_page=per_page,
+                                    log_page=log_page, log_per_page=log_per_page)
+                data = _sanitize_for_json(data)
+                body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+            except Exception as e:
+                try:
+                    err_msg = (str(e) or repr(e))[:500].replace("\\", " ").replace("\x00", "").replace("\r", " ")
+                    body = json.dumps({"error": f"加载数据失败: {err_msg}"}, ensure_ascii=False).encode("utf-8")
+                except Exception:
+                    body = '{"error":"加载数据失败"}'.encode("utf-8")
+            if body is not None:
+                if os.environ.get("DEBUG_RESPONSE_SIZE"):
+                    try:
+                        print(f"  [DEBUG] /api/data response size (before gzip): {len(body)} bytes")
+                    except Exception:
+                        pass
+                self._respond(200, "application/json", body,
+                             extra={"Access-Control-Allow-Origin": "*"})
 
         elif path == "/api/balance":
-            data = get_wallet_balance()
-            body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-            self._respond(200, "application/json", body,
-                          extra={"Access-Control-Allow-Origin": "*"})
+            body = None
+            try:
+                data = get_wallet_balance()
+                data = _sanitize_for_json(data)
+                body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+            except Exception as e:
+                try:
+                    body = json.dumps({"error": f"获取余额失败: {str(e)[:200]}"}, ensure_ascii=False).encode("utf-8")
+                except Exception:
+                    body = '{"error":"获取余额失败"}'.encode("utf-8")
+            if body is not None:
+                self._respond(200, "application/json", body,
+                              extra={"Access-Control-Allow-Origin": "*"})
 
         elif path == "/api/health":
             body = json.dumps({"status": "ok", "time": datetime.now().isoformat()}).encode()
+            self._respond(200, "application/json", body)
+
+        elif path == "/api/debug/small":
+            # 诊断用：极小 JSON，用于对比测试（若小响应从不失败而 /api/data 偶发失败，则根因为大响应被链路截断）
+            body = json.dumps({"ok": True, "ts": datetime.now().isoformat(), "size": "small"}).encode()
             self._respond(200, "application/json", body)
 
         else:
             self._respond(404, "text/plain", b"Not Found")
 
     def _respond(self, code, content_type, body, extra=None):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type + "; charset=utf-8")
-        if extra:
-            for k, v in extra.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            headers = dict(extra or {})
+            headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            # 压缩 JSON 响应，降低公网链路被中间设备截断的概率
+            if "application/json" in content_type and len(body) > 512:
+                body = gzip.compress(body, compresslevel=6)
+                headers["Content-Encoding"] = "gzip"
+            self.send_response(code)
+            self.send_header("Content-Type", content_type + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if headers:
+                for k, v in headers.items():
+                    if k.lower() not in ("content-length",):
+                        self.send_header(k, str(v))
+            self.end_headers()
+            # 使用底层 sendall，确保 body 全量发送，避免公网链路下出现短写导致 IncompleteRead
+            self.wfile.flush()
+            self.connection.sendall(body)
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as e:
+            try:
+                print(f"  [WARN] response interrupted: {type(e).__name__}: {e}")
+            except Exception:
+                pass
 
 
 def main():

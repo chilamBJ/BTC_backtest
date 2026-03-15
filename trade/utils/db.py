@@ -1,7 +1,7 @@
 """
 Trade 策略数据库模块（本项目专用）
 ==================================
-仅支持 seller、smart_seller。配置从项目根 .env 加载。
+仅支持 seller、smart_seller、model_seller。配置从项目根 .env 加载。
 """
 
 import os
@@ -163,6 +163,18 @@ def init_seller_tables(conn):
             level VARCHAR(10) DEFAULT 'info'
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS model_seller_activity (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT NOT NULL,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            markets_watching INT DEFAULT 0,
+            slugs_checked INT DEFAULT 0,
+            discovery_found INT DEFAULT 0,
+            decisions_summary JSON,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
     conn.commit()
     cur.close()
 
@@ -219,6 +231,110 @@ def init_smart_seller_tables(conn):
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS action_log (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            asset VARCHAR(20),
+            market_slug VARCHAR(255),
+            action VARCHAR(50) NOT NULL,
+            detail TEXT,
+            level VARCHAR(10) DEFAULT 'info'
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS model_seller_activity (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT NOT NULL,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            markets_watching INT DEFAULT 0,
+            slugs_checked INT DEFAULT 0,
+            discovery_found INT DEFAULT 0,
+            decisions_summary JSON,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    conn.commit()
+    cur.close()
+
+
+def init_model_seller_tables(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ended_at DATETIME NULL,
+            mode VARCHAR(20) NOT NULL,
+            params JSON,
+            total_trades INT DEFAULT 0,
+            total_pnl DOUBLE DEFAULT 0,
+            summary TEXT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS model_seller_activity (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT NOT NULL,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            markets_watching INT DEFAULT 0,
+            slugs_checked INT DEFAULT 0,
+            discovery_found INT DEFAULT 0,
+            decisions_summary JSON,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS model_seller_trades (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT,
+            asset VARCHAR(20) NOT NULL,
+            market_type VARCHAR(10) DEFAULT '15m',
+            slug VARCHAR(255) NOT NULL,
+            epoch INT NOT NULL,
+            UNIQUE KEY unique_slug (slug),
+            yes_token VARCHAR(255),
+            no_token VARCHAR(255),
+            question TEXT,
+            discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            trigger_side VARCHAR(20),
+            trigger_price DOUBLE,
+            trigger_elapsed DOUBLE,
+            trigger_phase VARCHAR(20),
+            p_yes DOUBLE,
+            feat_1 DOUBLE,
+            feat_2 DOUBLE,
+            feat_5 DOUBLE,
+            buy_side VARCHAR(10),
+            buy_price DOUBLE,
+            buy_amount DOUBLE,
+            buy_shares DOUBLE,
+            entry_at DATETIME NULL,
+            order_id VARCHAR(255),
+            order_success TINYINT,
+            order_response TEXT,
+            outcome VARCHAR(50),
+            pnl DOUBLE,
+            settled_at DATETIME NULL,
+            settle_method VARCHAR(50),
+            exit_type VARCHAR(20),
+            exit_price DOUBLE,
+            sl_reason VARCHAR(20),
+            skip_reason VARCHAR(30),
+            price_log JSON,
+            status VARCHAR(20) DEFAULT 'watching',
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    try:
+        cur.execute("ALTER TABLE model_seller_trades ADD UNIQUE KEY unique_slug (slug)")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE model_seller_trades ADD COLUMN no_trigger_reason VARCHAR(30) NULL")
+    except Exception:
+        pass
     cur.execute("""
         CREATE TABLE IF NOT EXISTS action_log (
             id INT AUTO_INCREMENT PRIMARY KEY,
