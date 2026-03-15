@@ -46,6 +46,44 @@ python run_collector.py
 pip install -r requirements.txt
 ```
 
+## 云端部署与代码同步
+
+采集器部署在香港 ECS，使用 systemd 管理。**本地为代码源，云端通过部署脚本同步。**
+
+### 部署到云端
+
+```bash
+# 需设置环境变量（勿提交到 git）
+export DEPLOY_PASSWORD='你的服务器密码'
+export TELEGRAM_BOT_TOKEN='你的机器人 token'
+export ADMIN_CHAT_ID='你的 chat_id'  # 可选
+
+bash scripts/deploy_to_ecs.sh
+```
+
+### 代码同步流程
+
+| 操作 | 命令 |
+|------|------|
+| 本地改代码 | 正常编辑 |
+| 同步到云端 | `bash scripts/deploy_to_ecs.sh` |
+| 提交到 Git | `git add -A && git commit -m "..." && git push` |
+
+**推荐流程**：本地修改 → 部署到云端验证 → 提交并推送到 Git。保持本地、云端、Git 三者一致。
+
+### 云端管理
+
+```bash
+# 查看状态
+ssh root@47.238.152.210 'systemctl status btc-collector'
+
+# 查看日志
+ssh root@47.238.152.210 'tail -f /root/btc_collector/collector.log'
+
+# 重启
+ssh root@47.238.152.210 'systemctl restart btc-collector'
+```
+
 ## 许可证
 
 MIT
