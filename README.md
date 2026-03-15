@@ -49,3 +49,9 @@ pip install -r requirements.txt
 ## 许可证
 
 MIT
+
+## telegram交互指令设计 (Commands)：
+*   `/status`：回复当前系统健康度。包括：运行时间、今日已采集的数据行数、当前 4 个 Queue 的积压长度（极其重要，若 Queue 持续变长说明 IO 堵死了）、最近一次自愈发生的时间。
+*   `/pause`：设置一个全局标志位 `is_paused = True`。各大网络接收流暂时丢弃数据，不压入队列（用于极端行情下服务器扛不住时人工介入）。
+*   `/resume`：恢复压入队列。
+*   `/stop`：触发优雅退出（Graceful Shutdown）。

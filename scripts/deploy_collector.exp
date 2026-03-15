@@ -1,0 +1,22 @@
+#!/usr/bin/expect -f
+# 部署数据采集器到远程 ECS（需传入密码与 token）
+set timeout 120
+set server "47.238.152.210"
+set user "root"
+set password [lindex $argv 0]
+set tg_token [lindex $argv 1]
+set admin_chat [lindex $argv 2]
+
+if {$password == "" || $tg_token == ""} {
+    puts "Usage: expect deploy_collector.exp <password> <telegram_token> \[admin_chat_id\]"
+    exit 1
+}
+
+# 测试连接
+spawn ssh -o StrictHostKeyChecking=no $user@$server "echo SSH_OK"
+expect {
+    "password:" { send "$password\r"; exp_continue }
+    "SSH_OK" { puts "\nSSH 连接成功"; exp_continue }
+    timeout { puts "连接超时"; exit 1 }
+    eof
+}

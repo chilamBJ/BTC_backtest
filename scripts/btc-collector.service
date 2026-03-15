@@ -1,0 +1,18 @@
+[Unit]
+Description=BTC Data Collector (Binance + Polymarket)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/btc_collector
+EnvironmentFile=/root/btc_collector/.env
+Environment="COLLECTOR_DATA_DIR=/root/btc_collector/collector_data"
+ExecStart=/root/btc_collector/venv/bin/python -u /root/btc_collector/run_collector.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/btc_collector/collector.log
+StandardError=append:/root/btc_collector/collector.log
+
+[Install]
+WantedBy=multi-user.target

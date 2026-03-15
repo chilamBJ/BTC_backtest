@@ -1,0 +1,5 @@
+# 数据采集器专用依赖（轻量，不含回测依赖）
+pandas>=2.0.0
+pyarrow>=14.0.0
+aiohttp>=3.9.0
+python-telegram-bot>=21.0

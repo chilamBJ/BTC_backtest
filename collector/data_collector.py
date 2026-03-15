@@ -648,16 +648,29 @@ async def send_alert(msg: str) -> None:
         print(f"[ALERT 发送失败] {e}\n{msg}")
 
 
-async def run_telegram_bot() -> asyncio.Task | None:
+async def run_telegram_bot() -> tuple[asyncio.Task | None, object]:
     """在已有事件循环中启动 Telegram Bot 监听（需在 main 中 await 后得到 polling 任务）。"""
     if not TELEGRAM_BOT_TOKEN or not ADMIN_CHAT_ID:
         print("未配置 TELEGRAM_BOT_TOKEN / ADMIN_CHAT_ID，Telegram 功能关闭")
-        return None
+        return None, None
 
     from telegram import Update
-    from telegram.ext import Application, CommandHandler, ContextTypes
+    from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID.isdigit() else None
+    admin_filter = filters.Chat(chat_id=admin_id) if admin_id else None
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
+        .get_updates_read_timeout(65.0)
+        .get_updates_write_timeout(30.0)
+        .build()
+    )
 
     async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         uptime = time.time() - start_time
@@ -695,12 +708,17 @@ async def run_telegram_bot() -> asyncio.Task | None:
         await update.message.reply_text("🛑 正在优雅退出…")
         shutdown_event.set()
 
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("pause", pause_cmd))
-    app.add_handler(CommandHandler("resume", resume_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
+    cmd_filter = admin_filter or filters.ALL
+    app.add_handler(CommandHandler("status", status_cmd, filters=cmd_filter))
+    app.add_handler(CommandHandler("pause", pause_cmd, filters=cmd_filter))
+    app.add_handler(CommandHandler("resume", resume_cmd, filters=cmd_filter))
+    app.add_handler(CommandHandler("stop", stop_cmd, filters=cmd_filter))
     await app.initialize()
-    return asyncio.create_task(app.run_polling(drop_pending_updates=True))
+    await app.start()
+    polling_task = asyncio.create_task(
+        app.updater.start_polling(drop_pending_updates=True, timeout=55)
+    )
+    return polling_task, app
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +761,7 @@ async def main() -> None:
     ]
 
     # Telegram Bot
-    bot_task = await run_telegram_bot()
+    bot_task, bot_app = await run_telegram_bot()
 
     # 信号处理：SIGINT/SIGTERM 触发优雅退出（Unix；Windows 下 Ctrl+C 会抛 CancelledError）
     def do_shutdown():
@@ -766,7 +784,11 @@ async def main() -> None:
             await t
         except asyncio.CancelledError:
             pass
-    if bot_task:
+    if bot_task and bot_app:
+        try:
+            await bot_app.updater.stop()
+        except Exception:
+            pass
         bot_task.cancel()
         try:
             await bot_task
