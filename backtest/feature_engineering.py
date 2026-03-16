@@ -214,6 +214,7 @@ def compute_features(
 
     # feat_rsi_14: RSI(14) on 5m close at Bar2 end
     # RSI > 70 超买（动量可能耗尽），RSI < 30 超卖（反弹预期）
+    # RSI-14: standard RSI uses EWM with com=N-1 (where N=14), i.e., com=13
     delta = k5["close"].diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)

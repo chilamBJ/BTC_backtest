@@ -16,9 +16,16 @@
 
 3. **多因子组合穷举**：对所有因子组合（支持 2～3 个因子）进行分位数分桶，
    找出满足 P > target_prob 且样本量 >= min_samples 的所有组合，
-   按胜率降序输出 Top-N。
+   按胜率降序输出 Top-N。同时输出每个因子的精确数值阈值（bin_thresholds），
+   可直接用于实盘过滤条件。
 
-4. **LGBM 决策路径分析**：使用 LGBM 训练后的叶节点规则，
+4. **走势滚动验证（Walk-Forward Validation）**：将数据按时间切分成 N 个折叠，
+   用全量数据确定的分位数阈值在各时间段内单独测试胜率，评估组合的跨时稳健性。
+
+5. **交易过滤器导出（Trading Filters Export）**：将高胜率组合转为可直接执行的
+   IF 条件规则，导出为人类可读格式及可选的 JSON 文件。
+
+6. **LGBM 决策路径分析**：使用 LGBM 训练后的叶节点规则，
    输出自动挖掘到的高概率叶节点的因子阈值条件。
 
 因子说明
@@ -26,8 +33,8 @@
 V1 核心因子（原有）：
   feat_1  尾盘 60s CVD 比率，[-1,1]        — 微观买卖量失衡
   feat_2  尾盘交易密集度突变率              — Tick Intensity Surge
-  feat_3  持仓量增量 %                      — OI Delta
-  feat_4  期现溢价变化                      — Basis Change
+  feat_3  持仓量增量 %                      — OI Delta（⚠ 无真实 OI 时为占位）
+  feat_4  期现溢价变化                      — Basis Change（⚠ 无真实数据时为占位）
   feat_5  4H VWAP 偏离度（bps）             — Distance to HTF VWAP
 
 V2 扩展因子（新增）：
@@ -193,7 +200,13 @@ def find_combinations_above_threshold(
     找出满足 P(Y=1) > target_prob 且样本量 >= min_samples 的所有条件。
 
     返回 DataFrame，列：
-      factors, bin_ranges, count, win_rate, alpha, combo_size
+      factors        — 因子名称（逗号分隔）
+      bin_key        — 可读的桶区间描述
+      bin_thresholds — dict[str, (float, float)]，每个因子的 (下界, 上界)，可直接用于实盘过滤
+      combo_size     — 组合因子数
+      count          — 该桶的样本数
+      win_rate       — P(Y=1) 胜率
+      alpha          — win_rate - 全样本基准胜率
     按 win_rate 降序排列。
     """
     if factor_cols is None:
@@ -202,35 +215,46 @@ def find_combinations_above_threshold(
     df = features_df[factor_cols + [target_col]].dropna().copy()
     base_wr = float(df[target_col].mean())
 
-    # 预先分桶
-    bin_map: dict[str, pd.Series] = {}
-    bin_edges: dict[str, list] = {}
+    # 预先分桶，保存 pd.Interval 类型便于提取阈值
+    bin_cat_map: dict[str, pd.Series] = {}   # factor -> Categorical[Interval] series
+    bin_str_map: dict[str, pd.Series] = {}   # factor -> str series (for readable key)
     for col in factor_cols:
         try:
-            binned, edges = pd.qcut(df[col], q=n_bins, retbins=True, duplicates="drop")
-            bin_map[col] = binned.astype(str)
-            bin_edges[col] = list(edges)
+            binned, _ = pd.qcut(df[col], q=n_bins, retbins=True, duplicates="drop")
+            bin_cat_map[col] = binned
+            bin_str_map[col] = binned.astype(str)
         except ValueError:
             pass
 
-    valid_cols = list(bin_map.keys())
+    valid_cols = list(bin_cat_map.keys())
     results = []
-    bin_labels = BIN_LABELS_3[:n_bins]
 
     for size in range(1, max_combo_size + 1):
         for combo in itertools.combinations(valid_cols, size):
-            # 构建组合 key
-            combo_bins = pd.Series([""] * len(df), index=df.index)
+            # Build a temporary DataFrame with the categorical bins for this combo
+            tmp = df[[target_col]].copy()
             for col in combo:
-                combo_bins = combo_bins + bin_map[col]
-            grouped = df.groupby(combo_bins.values)[target_col].agg(["count", "mean"])
+                tmp[f"_b_{col}"] = bin_cat_map[col]
+            bin_cols = [f"_b_{col}" for col in combo]
+            grouped = tmp.groupby(bin_cols, observed=True)[target_col].agg(["count", "mean"])
             grouped.columns = ["count", "win_rate"]
-            # 筛选满足条件的分组
             mask = (grouped["win_rate"] > target_prob) & (grouped["count"] >= min_samples)
-            for bin_key, row in grouped[mask].iterrows():
+            for group_idx, row in grouped[mask].iterrows():
+                # group_idx is a tuple of pd.Interval (or single Interval if size=1)
+                intervals = (group_idx,) if size == 1 else group_idx
+                # Extract actual numeric thresholds
+                thresholds: dict[str, tuple[float, float]] = {}
+                parts: list[str] = []
+                for i, col in enumerate(combo):
+                    iv = intervals[i]
+                    lo, hi = float(iv.left), float(iv.right)
+                    thresholds[col] = (lo, hi)
+                    parts.append(f"{col}: ({lo:.4f}, {hi:.4f}]")
+                bin_key_str = " & ".join(parts)
                 results.append({
-                    "factors": " + ".join(combo),
-                    "bin_key": bin_key,
+                    "factors": ", ".join(combo),
+                    "bin_key": bin_key_str,
+                    "bin_thresholds": thresholds,
                     "combo_size": size,
                     "count": int(row["count"]),
                     "win_rate": round(float(row["win_rate"]), 4),
@@ -238,13 +262,209 @@ def find_combinations_above_threshold(
                 })
 
     if not results:
-        return pd.DataFrame(columns=["factors", "bin_key", "combo_size", "count", "win_rate", "alpha"])
+        return pd.DataFrame(columns=[
+            "factors", "bin_key", "bin_thresholds", "combo_size", "count", "win_rate", "alpha"
+        ])
     out = pd.DataFrame(results).sort_values("win_rate", ascending=False).reset_index(drop=True)
     return out
 
 
 # ---------------------------------------------------------------------------
-# 4. 高概率叶节点分析（LGBM 决策路径）
+# 4. Walk-Forward Validation for Top Combos（时间滚动稳健性验证）
+# ---------------------------------------------------------------------------
+
+def combo_walkforward_validation(
+    features_df: pd.DataFrame,
+    top_combos: pd.DataFrame,
+    n_folds: int = 4,
+    target_col: str = "target",
+    time_col: str = "t0",
+    target_prob: float = 0.55,
+    top_k: int = 10,
+    min_robust_fold_ratio: float = 0.5,
+) -> pd.DataFrame:
+    """
+    对 top_combos 中的高胜率组合做时间分层稳健性验证。
+
+    原理
+    ----
+    用全量数据学到的分位数阈值（存储在 bin_thresholds 列），
+    在按时间等分的 n_folds 个时段内分别计算实际胜率，
+    评估该组合是否在各个时间段都稳定有效，还是只在某段数据中过拟合。
+
+    参数
+    ----
+    top_combos           : find_combinations_above_threshold() 的输出（需含 bin_thresholds 列）
+    n_folds              : 时间切片数量（建议 3~5）
+    top_k                : 仅对前 k 个组合做验证（节省计算）
+    target_prob          : 稳健性判断阈值（各折胜率 > 此值才算该折通过）
+    min_robust_fold_ratio: 通过折数占有效折数的最低比例（默认 0.5 = 超过半数通过则视为稳健）
+
+    返回
+    ----
+    DataFrame，列：
+      factors, bin_key, full_win_rate, mean_fold_wr, std_fold_wr,
+      n_folds_above_target, is_robust, fold_details
+    """
+    if "bin_thresholds" not in top_combos.columns:
+        warnings.warn("top_combos 缺少 bin_thresholds 列，请先调用新版 find_combinations_above_threshold()")
+        return pd.DataFrame()
+
+    if time_col not in features_df.columns:
+        # fallback to row-order split
+        features_df = features_df.copy()
+        features_df[time_col] = pd.RangeIndex(len(features_df))
+
+    # Sort by time and split into folds
+    df_sorted = features_df.sort_values(time_col).reset_index(drop=True)
+    fold_size = len(df_sorted) // n_folds
+    if fold_size < 5:
+        warnings.warn(f"数据量不足（每折仅 {fold_size} 行），走势验证可能不可靠。")
+
+    fold_boundaries = [i * fold_size for i in range(n_folds)] + [len(df_sorted)]
+    folds = [df_sorted.iloc[fold_boundaries[i]:fold_boundaries[i + 1]] for i in range(n_folds)]
+
+    results = []
+    for _, combo_row in top_combos.head(top_k).iterrows():
+        thresholds: dict = combo_row["bin_thresholds"]
+        if not thresholds:
+            continue
+
+        fold_win_rates = []
+        fold_counts = []
+        for fold_df in folds:
+            # Apply threshold filters to this fold
+            mask = pd.Series([True] * len(fold_df), index=fold_df.index)
+            for col, (lo, hi) in thresholds.items():
+                if col not in fold_df.columns:
+                    mask[:] = False
+                    break
+                mask = mask & (fold_df[col] > lo) & (fold_df[col] <= hi)
+            filtered = fold_df.loc[mask, target_col].dropna()
+            if len(filtered) >= 5:
+                fold_win_rates.append(float(filtered.mean()))
+                fold_counts.append(len(filtered))
+            else:
+                fold_win_rates.append(np.nan)
+                fold_counts.append(0)
+
+        valid_fold_wrs = [w for w in fold_win_rates if not np.isnan(w)]
+        mean_wr = float(np.mean(valid_fold_wrs)) if valid_fold_wrs else np.nan
+        std_wr = float(np.std(valid_fold_wrs)) if len(valid_fold_wrs) > 1 else np.nan
+        n_above = sum(1 for w in valid_fold_wrs if w > target_prob)
+        # A combo is robust if it beats target_prob in at least min_robust_fold_ratio of valid folds
+        min_folds_needed = max(1, int(np.ceil(len(valid_fold_wrs) * min_robust_fold_ratio)))
+        is_robust = (n_above >= min_folds_needed) and not np.isnan(mean_wr)
+        fold_details = "; ".join(
+            f"折{i+1}(n={fold_counts[i]})={fold_win_rates[i]:.2%}" if not np.isnan(fold_win_rates[i])
+            else f"折{i+1}(n=0)=N/A"
+            for i in range(n_folds)
+        )
+        results.append({
+            "factors": combo_row["factors"],
+            "bin_key": combo_row["bin_key"],
+            "full_win_rate": combo_row["win_rate"],
+            "full_count": combo_row["count"],
+            "mean_fold_wr": round(mean_wr, 4) if not np.isnan(mean_wr) else np.nan,
+            "std_fold_wr": round(std_wr, 4) if not np.isnan(std_wr) else np.nan,
+            "n_folds_above_target": n_above,
+            "n_valid_folds": len(valid_fold_wrs),
+            "is_robust": is_robust,
+            "fold_details": fold_details,
+        })
+
+    if not results:
+        return pd.DataFrame()
+    result_df = pd.DataFrame(results)
+    # Sort: robust first, then by mean_fold_wr desc
+    result_df = result_df.sort_values(
+        ["is_robust", "mean_fold_wr"], ascending=[False, False]
+    ).reset_index(drop=True)
+    return result_df
+
+
+# ---------------------------------------------------------------------------
+# 5. 交易过滤器导出（Trading Filters Export）
+# ---------------------------------------------------------------------------
+
+def export_trading_filters(
+    top_combos: pd.DataFrame,
+    target_prob: float = 0.55,
+    top_k: int = 10,
+    save_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    将高胜率因子组合转换为可直接使用的 IF 条件规则，
+    并可选导出到 JSON 文件。
+
+    返回 DataFrame，列：
+      rank, factors, conditions_human, conditions_dict, expected_win_rate, sample_count, alpha
+
+    conditions_human 示例：
+      "feat_1 > -0.05 AND feat_1 <= 0.02 AND feat_2 > 0.95 AND feat_2 <= 1.04"
+
+    conditions_dict 可直接用于代码中的过滤：
+      {"feat_1": (-0.05, 0.02), "feat_2": (0.95, 1.04)}
+    """
+    if "bin_thresholds" not in top_combos.columns:
+        warnings.warn("top_combos 缺少 bin_thresholds 列，请使用新版 find_combinations_above_threshold()")
+        return pd.DataFrame()
+
+    rows = []
+    for rank, (_, combo_row) in enumerate(top_combos.head(top_k).iterrows(), start=1):
+        thresholds: dict = combo_row["bin_thresholds"]
+        conditions_parts = []
+        for col, (lo, hi) in thresholds.items():
+            desc = FEATURE_DESC.get(col, col)
+            conditions_parts.append(f"{col} > {lo:.6f} AND {col} <= {hi:.6f}  # {desc}")
+        conditions_human = " AND \n    ".join(conditions_parts)
+        rows.append({
+            "rank": rank,
+            "factors": combo_row["factors"],
+            "expected_win_rate": combo_row["win_rate"],
+            "alpha": combo_row["alpha"],
+            "sample_count": combo_row["count"],
+            "combo_size": combo_row.get("combo_size", len(thresholds)),
+            "conditions_human": conditions_human,
+            "conditions_dict": thresholds,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    filters_df = pd.DataFrame(rows)
+
+    if save_path:
+        import json
+        # Build a clean serializable dict
+        output = {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "target_prob_threshold": target_prob,
+            "filters": [
+                {
+                    "rank": r["rank"],
+                    "factors": r["factors"],
+                    "expected_win_rate": r["expected_win_rate"],
+                    "alpha": r["alpha"],
+                    "sample_count": r["sample_count"],
+                    "conditions": {col: {"gt": lo, "lte": hi} for col, (lo, hi) in r["conditions_dict"].items()},
+                    "conditions_human": r["conditions_human"],
+                }
+                for r in rows
+            ],
+        }
+        try:
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(output, f, ensure_ascii=False, indent=2)
+            print(f"  [✓] 交易过滤器已保存到: {save_path}")
+        except OSError as e:
+            warnings.warn(f"保存过滤器文件失败: {e}")
+
+    return filters_df
+
+
+# ---------------------------------------------------------------------------
+# 6. 高概率叶节点分析（LGBM 决策路径）
 # ---------------------------------------------------------------------------
 
 def lgbm_leaf_analysis(
@@ -330,7 +550,7 @@ def lgbm_leaf_analysis(
 
 
 # ---------------------------------------------------------------------------
-# 5. 综合报告打印
+# 7. 综合报告打印
 # ---------------------------------------------------------------------------
 
 def print_streak_analysis_report(
@@ -341,25 +561,39 @@ def print_streak_analysis_report(
     target_prob: float = 0.55,
     top_n_combos: int = 20,
     pair_factors: Optional[tuple[str, str]] = None,
+    n_walk_folds: int = 4,
+    show_walk_forward: bool = True,
+    show_trading_filters: bool = True,
+    save_filters_path: Optional[str] = None,
+    mock_oi: bool = False,
+    mock_premium: bool = False,
 ) -> None:
     """
     打印完整的连续趋势概率分析报告。包含：
-      【0】因子合理性评估与建议
+      【0】因子合理性评估与建议（含数据质量警告）
       【1】样本基础信息（事件数、基准胜率）
       【2】各因子单独的分位数条件概率分析
       【3】最优双因子交叉矩阵
-      【4】满足 P > target_prob 的多因子组合排行
+      【4】满足 P > target_prob 的多因子组合排行（含实际阈值）
       【5】LGBM 高概率叶节点解读（若安装 lightgbm）
+      【6】Walk-Forward 时间分层稳健性验证（Top 组合）
+      【7】交易过滤器导出（可直接用于策略过滤条件）
 
     参数
     ----
-    features_df   : compute_features() 输出的 DataFrame（含 target）
-    factor_cols   : 分析的因子列名；默认自动检测所有已知因子
-    n_bins        : 每个因子的分位数桶数（3 = 低/中/高）
-    min_samples   : 每个桶的最小样本量阈值
-    target_prob   : 目标胜率阈值（默认 0.55 = 超过 50% 且有实质 Alpha）
-    top_n_combos  : 输出 Top-N 因子组合
-    pair_factors  : 双因子分析指定的 (factor_a, factor_b)；若 None 则自动选前两个
+    features_df         : compute_features() 输出的 DataFrame（含 target）
+    factor_cols         : 分析的因子列名；默认自动检测所有已知因子
+    n_bins              : 每个因子的分位数桶数（3 = 低/中/高）
+    min_samples         : 每个桶的最小样本量阈值
+    target_prob         : 目标胜率阈值（默认 0.55 = 超过 55%）
+    top_n_combos        : 输出 Top-N 因子组合
+    pair_factors        : 双因子分析指定的 (factor_a, factor_b)；若 None 则自动选前两个
+    n_walk_folds        : Walk-Forward 时间切片数量
+    show_walk_forward   : 是否展示 Walk-Forward 验证结果
+    show_trading_filters: 是否展示交易过滤器导出
+    save_filters_path   : 若非 None，将过滤条件保存到此 JSON 文件路径
+    mock_oi             : 若 True，提示 feat_3 使用了占位 OI 数据
+    mock_premium        : 若 True，提示 feat_4 使用了占位 Premium 数据
     """
     if factor_cols is None:
         factor_cols = [c for c in ALL_FEATURE_COLS if c in features_df.columns]
@@ -381,7 +615,7 @@ def print_streak_analysis_report(
     print()
     print("【0】因子合理性评估与建议")
     print(SEP)
-    _print_factor_evaluation()
+    _print_factor_evaluation(mock_oi=mock_oi, mock_premium=mock_premium)
 
     # ── 【1】样本基础信息 ──────────────────────────────────────────────────
     print("\n【1】样本基础信息")
@@ -391,12 +625,25 @@ def print_streak_analysis_report(
     print(f"  • 分析目标阈值 (Target Prob)                      : {target_prob:.0%}")
     print(f"  • 分析因子数量                                     : {len(available)}")
     print(f"  • 分析因子列表: {available}")
+    if mock_oi or mock_premium:
+        print()
+        print("  ⚠ 数据质量提示:")
+        if mock_oi:
+            print("    feat_3 (OI Delta): 使用占位数据，信号可能不反映真实持仓变化。")
+            print("    → 建议提供真实 OI CSV 以获得可靠的 feat_3 信号。")
+        if mock_premium:
+            print("    feat_4 (Basis Change): 使用占位数据，信号可能不反映真实期现溢价。")
+            print("    → 建议提供真实 Premium CSV 以获得可靠的 feat_4 信号。")
     print()
     print("  [因子缺失值统计]")
+    has_missing = False
     for col in available:
         na = int(features_df[col].isna().sum())
         if na > 0:
             print(f"    {col}: {na} 个缺失值 ({na/total_n:.1%})")
+            has_missing = True
+    if not has_missing:
+        print("    (无缺失值)")
     print()
 
     # ── 【2】单因子条件概率 ───────────────────────────────────────────────
@@ -404,7 +651,8 @@ def print_streak_analysis_report(
     print(SEP)
     for col in available:
         desc = FEATURE_DESC.get(col, col)
-        print(f"\n  ▶ {col} — {desc}")
+        mock_flag = " [⚠占位数据]" if (col == "feat_3" and mock_oi) or (col == "feat_4" and mock_premium) else ""
+        print(f"\n  ▶ {col} — {desc}{mock_flag}")
         cond_df = factor_conditional_prob(features_df, col, n_bins=n_bins, min_samples=min_samples)
         if cond_df.empty:
             print("    (样本量不足，跳过)")
@@ -457,7 +705,7 @@ def print_streak_analysis_report(
     print()
 
     # ── 【4】多因子组合穷举 ───────────────────────────────────────────────
-    print("【4】多因子组合穷举 — P > {:.0%} 的因子值区间组合".format(target_prob))
+    print("【4】多因子组合穷举 — P > {:.0%} 的因子值区间组合（含精确阈值）".format(target_prob))
     print(SEP)
     combos = find_combinations_above_threshold(
         features_df,
@@ -470,12 +718,13 @@ def print_streak_analysis_report(
     if combos.empty:
         print(f"  未找到满足 P > {target_prob:.0%} 且 n >= {min_samples} 的因子组合。")
         print(f"  建议：降低 target_prob 或 min_samples，或增加数据量。")
+        combos = pd.DataFrame()
     else:
         print(f"  共找到 {len(combos)} 个满足条件的因子组合，展示 Top-{top_n_combos}：\n")
         for i, row in combos.head(top_n_combos).iterrows():
             print(f"  #{i+1:>3}  [{row['combo_size']}因子]  P={row['win_rate']:.2%}  "
-                  f"Alpha={row['alpha']:+.2%}  n={row['count']:>5}  "
-                  f"因子: {row['factors']}")
+                  f"Alpha={row['alpha']:+.2%}  n={row['count']:>5}  因子: {row['factors']}")
+            print(f"        阈值: {row['bin_key']}")
     print()
 
     # ── 【5】LGBM 叶节点 ──────────────────────────────────────────────────
@@ -498,7 +747,6 @@ def print_streak_analysis_report(
                 print(f"  树{row['tree_idx']:>2} 叶{row['leaf_id']:>3}  "
                       f"n={row['count']:>5}  预测概率={row['pred_prob_avg']:.2%}  "
                       f"实际胜率={row['actual_win_rate']:.2%}")
-                # 解析因子范围并简洁打印
                 try:
                     ranges = ast.literal_eval(row["factor_ranges"])
                     for fname, (lo, hi) in ranges.items():
@@ -507,12 +755,87 @@ def print_streak_analysis_report(
                 except Exception:
                     print(f"      {row['factor_ranges']}")
                 print()
+    print()
+
+    # ── 【6】Walk-Forward 稳健性验证 ─────────────────────────────────────
+    print("【6】Walk-Forward 时间分层稳健性验证 (Walk-Forward Validation)")
+    print(SEP)
+    if not show_walk_forward:
+        print("  (已跳过，使用 --walk-forward 开启)")
+    elif combos is None or (hasattr(combos, 'empty') and combos.empty):
+        print("  (无满足条件的组合，跳过验证)")
+    else:
+        print(f"  按时间等分 {n_walk_folds} 折，验证 Top 组合的跨时稳健性（样本量不足的折叠标注 N/A）\n")
+        wf_df = combo_walkforward_validation(
+            features_df,
+            top_combos=combos,
+            n_folds=n_walk_folds,
+            target_prob=target_prob,
+            top_k=min(10, len(combos)),
+        )
+        if wf_df.empty:
+            print("  (走势验证无结果，可能数据量不足)")
+        else:
+            robust_count = int(wf_df["is_robust"].sum())
+            print(f"  验证 Top-{len(wf_df)} 组合，其中 {robust_count} 个通过稳健性检验：\n")
+            for _, r in wf_df.iterrows():
+                robust_label = "✅ 稳健" if r["is_robust"] else "⚠ 不稳定"
+                mean_wr = f"{r['mean_fold_wr']:.2%}" if not pd.isna(r['mean_fold_wr']) else "N/A"
+                std_wr = f"{r['std_fold_wr']:.2%}" if not pd.isna(r['std_fold_wr']) else "N/A"
+                print(f"  {robust_label}  全量P={r['full_win_rate']:.2%}  "
+                      f"折均P={mean_wr}  折标准差={std_wr}  "
+                      f"超阈折数={r['n_folds_above_target']}/{r['n_valid_folds']}")
+                print(f"    因子: {r['factors']}")
+                print(f"    各折: {r['fold_details']}")
+                print()
+        print("  📌 注意：折均P 与全量P 差距过大，或标准差过高，说明组合可能存在时间依赖性过拟合。")
+    print()
+
+    # ── 【7】交易过滤器导出 ───────────────────────────────────────────────
+    print("【7】交易过滤器导出 (Trading Filter Conditions)")
+    print(SEP)
+    if not show_trading_filters:
+        print("  (已跳过，使用 --save-filters 开启)")
+    elif combos is None or (hasattr(combos, 'empty') and combos.empty):
+        print("  (无满足条件的组合，跳过过滤器导出)")
+    else:
+        # 优先展示 Walk-Forward 验证通过的组合
+        if show_walk_forward and not wf_df.empty:
+            robust_combos = wf_df[wf_df["is_robust"]].head(5)
+            filters_source = combos[combos["factors"].isin(robust_combos["factors"])].head(5)
+            if filters_source.empty:
+                filters_source = combos.head(5)
+            label = "稳健性验证通过的"
+        else:
+            filters_source = combos.head(5)
+            label = "全量胜率最高的"
+        print(f"  展示 {label} Top-5 组合的可执行过滤条件：\n")
+        filters_df = export_trading_filters(
+            filters_source,
+            target_prob=target_prob,
+            top_k=5,
+            save_path=save_filters_path,
+        )
+        for _, frow in filters_df.iterrows():
+            print(f"  [过滤器 #{frow['rank']}]  预期胜率={frow['expected_win_rate']:.2%}  "
+                  f"Alpha={frow['alpha']:+.2%}  样本量={frow['sample_count']}  "
+                  f"[{frow['combo_size']}因子]")
+            print(f"    IF:")
+            print(f"    {frow['conditions_human']}")
+            print(f"    → 预期第三根 K 线延续同向概率 = {frow['expected_win_rate']:.2%}")
+            print()
+        if save_filters_path:
+            print(f"  [✓] 完整过滤条件已保存到 JSON: {save_filters_path}")
+        else:
+            print("  💡 提示: 使用 --save-filters filters.json 可将过滤条件保存到文件。")
     print(SEP + "\n")
 
 
-def _print_factor_evaluation() -> None:
+def _print_factor_evaluation(mock_oi: bool = False, mock_premium: bool = False) -> None:
     """打印因子合理性评估与研究建议（基于市场微结构文献综述）。"""
-    print("""
+    mock_oi_flag = " [⚠ 当前使用占位数据，信号不可靠]" if mock_oi else ""
+    mock_premium_flag = " [⚠ 当前使用占位数据，信号不可靠]" if mock_premium else ""
+    print(f"""
   ┌─────────────────────────────────────────────────────────────────────┐
   │             因子体系评估（V1 + V2 共 9 个因子）                       │
   └─────────────────────────────────────────────────────────────────────┘
@@ -523,10 +846,11 @@ def _print_factor_evaluation() -> None:
          CVD > 0 且加速是趋势延续的强信号。
   ✅ feat_2  交易密集度突变率
        → Tick 频率突增表明流动性吸收方向明确，动能加速（Hasbrouck 2007）。
-  ⚠  feat_3  OI 增量 %
+  ⚠  feat_3  OI 增量 %{mock_oi_flag}
        → OI 增加 + 上涨 = 新多头建仓（健康趋势）；OI 减少 + 上涨 = 空头回补。
          1 分钟或 5 分钟粒度 OI 数据延迟可能降低信号质量。
-  ⚠  feat_4  期现溢价变化
+         提供真实 OI 数据可显著提升 feat_3 的预测能力。
+  ⚠  feat_4  期现溢价变化{mock_premium_flag}
        → 基差缩小（Perp 弱于 Spot）表明衍生品过度定价正在修正，
          连涨动能耗尽风险增大。信号较弱，需配合其他因子。
   ✅ feat_5  4H VWAP 偏离度

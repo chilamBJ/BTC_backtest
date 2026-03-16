@@ -17,17 +17,20 @@ python run_streak_analysis.py \\
     --trades-1s data/BTCUSDT_1s.csv \\
     --direction 1
 
-# 指定目标阈值与分桶数
-python run_streak_analysis.py --mock --target-prob 0.55 --n-bins 3
+# 指定目标阈值与分桶数，并保存过滤器
+python run_streak_analysis.py --mock --target-prob 0.55 --n-bins 3 \\
+    --walk-forward --save-filters filters.json
 
 输出说明
 --------
-  【0】因子合理性评估与建议
+  【0】因子合理性评估与建议（含数据质量警告）
   【1】样本基础信息（事件数、基准胜率）
   【2】各因子单独的分位数条件概率分析
   【3】最优双因子交叉矩阵
-  【4】满足 P > target_prob 的多因子组合排行
+  【4】满足 P > target_prob 的多因子组合排行（含精确阈值）
   【5】LGBM 高概率叶节点解读
+  【6】Walk-Forward 时间分层稳健性验证
+  【7】交易过滤器导出（可直接用于策略过滤条件）
 """
 
 from __future__ import annotations
@@ -54,6 +57,9 @@ def run_streak_with_mock(
     target_prob: float = 0.55,
     n_bins: int = 3,
     min_samples: int = 10,
+    walk_forward: bool = True,
+    n_folds: int = 4,
+    save_filters: str = "",
 ) -> None:
     """使用约 1 周 Mock 数据跑通连续趋势概率分析管道。"""
     print("使用 Mock 数据（约 1 周）跑通连续趋势概率分析管道...")
@@ -81,6 +87,12 @@ def run_streak_with_mock(
         min_samples=min_samples,
         target_prob=target_prob,
         top_n_combos=20,
+        n_walk_folds=n_folds,
+        show_walk_forward=walk_forward,
+        show_trading_filters=True,
+        save_filters_path=save_filters or None,
+        mock_oi=True,       # Mock data always uses placeholder OI
+        mock_premium=True,  # Mock data always uses placeholder Premium
     )
 
 
@@ -93,6 +105,9 @@ def run_streak_with_real_data(
     target_prob: float = 0.55,
     n_bins: int = 3,
     min_samples: int = 30,
+    walk_forward: bool = True,
+    n_folds: int = 4,
+    save_filters: str = "",
 ) -> None:
     """使用真实数据运行连续趋势概率分析管道。"""
     print("加载 5m K 线...")
@@ -102,17 +117,22 @@ def run_streak_with_real_data(
     print("从 1s 文件流式聚合 bar 统计（可能需数分钟）...")
     bar_stats = load_bar_stats_from_1s_binance(path_1s)
 
+    using_mock_oi = False
+    using_mock_premium = False
+
     if path_oi and Path(path_oi).exists():
         oi = load_oi(path_oi)
     else:
-        print("未提供 OI 文件，使用 5m K 线生成占位 OI 数据。")
+        print("未提供 OI 文件，使用 5m K 线生成占位 OI 数据。[feat_3 信号不可靠]")
         oi, _ = create_dummy_oi_premium_from_5m(kline_5m)
+        using_mock_oi = True
 
     if path_premium and Path(path_premium).exists():
         premium = load_premium(path_premium)
     else:
-        print("未提供 Premium 文件，使用 5m K 线生成占位期现数据。")
+        print("未提供 Premium 文件，使用 5m K 线生成占位期现数据。[feat_4 信号不可靠]")
         _, premium = create_dummy_oi_premium_from_5m(kline_5m)
+        using_mock_premium = True
 
     event_df, meta = build_event_pool_and_1s_slices(
         kline_5m, trades_1s=None, oi=oi, premium=premium,
@@ -131,6 +151,12 @@ def run_streak_with_real_data(
         min_samples=min_samples,
         target_prob=target_prob,
         top_n_combos=30,
+        n_walk_folds=n_folds,
+        show_walk_forward=walk_forward,
+        show_trading_filters=True,
+        save_filters_path=save_filters or None,
+        mock_oi=using_mock_oi,
+        mock_premium=using_mock_premium,
     )
 
 
@@ -149,15 +175,23 @@ def main() -> None:
     parser.add_argument("--trades-1s", type=str, default="",
                         help="1 秒聚合交易 CSV 路径")
     parser.add_argument("--oi", type=str, default="",
-                        help="持仓量 CSV 路径（可选，无则自动生成占位数据）")
+                        help="持仓量 CSV 路径（可选，无则自动生成占位数据，feat_3 不可靠）")
     parser.add_argument("--premium", type=str, default="",
-                        help="期现溢价 CSV 路径（可选）")
+                        help="期现溢价 CSV 路径（可选，无则自动生成占位数据，feat_4 不可靠）")
     parser.add_argument("--target-prob", type=float, default=0.55,
                         help="目标胜率阈值，默认 0.55（超过 55%%）")
     parser.add_argument("--n-bins", type=int, default=3,
                         help="每个因子的分位数桶数（2=低/高，3=低/中/高，5=五档）")
     parser.add_argument("--min-samples", type=int, default=20,
                         help="每个桶的最小样本量，低于此值的组合不纳入统计")
+    parser.add_argument("--walk-forward", action="store_true", default=True,
+                        help="展示 Walk-Forward 时间分层稳健性验证（默认开启）")
+    parser.add_argument("--no-walk-forward", action="store_false", dest="walk_forward",
+                        help="关闭 Walk-Forward 验证")
+    parser.add_argument("--n-folds", type=int, default=4,
+                        help="Walk-Forward 时间切片数量（默认 4）")
+    parser.add_argument("--save-filters", type=str, default="",
+                        help="将高胜率过滤条件保存到此 JSON 文件（如 filters.json）")
     args = parser.parse_args()
 
     if args.mock or not (args.kline_5m and args.trades_1s):
@@ -167,6 +201,9 @@ def main() -> None:
                 target_prob=args.target_prob,
                 n_bins=args.n_bins,
                 min_samples=args.min_samples,
+                walk_forward=args.walk_forward,
+                n_folds=args.n_folds,
+                save_filters=args.save_filters,
             )
         else:
             print("请提供 --kline-5m 与 --trades-1s 路径，或使用 --mock 跑 Mock 数据。")
@@ -181,6 +218,9 @@ def main() -> None:
             target_prob=args.target_prob,
             n_bins=args.n_bins,
             min_samples=args.min_samples,
+            walk_forward=args.walk_forward,
+            n_folds=args.n_folds,
+            save_filters=args.save_filters,
         )
 
 
