@@ -1,7 +1,20 @@
 """
 特征工程模块 (feature_engineering.py)
-在事件触发器确定的截面时间（Bar2 第 299 秒）计算 5 个正交特征，严格不引入未来数据。
+在事件触发器确定的截面时间（Bar2 第 299 秒）计算核心特征与扩展特征，严格不引入未来数据。
 全部采用向量化/groupby 实现，避免逐 K 线 for 循环。
+
+原始 5 个正交特征（V1）：
+  feat_1  尾盘微观买卖量失衡 (Last-Minute CVD Ratio)
+  feat_2  尾盘交易密集度突变率 (Tick Intensity Surge)
+  feat_3  持仓量增量 (OI Delta %)
+  feat_4  期现溢价变化 (Basis Change)
+  feat_5  宏观 VWAP 偏离度 (Distance to 4H VWAP, bps)
+
+扩展特征（V2）：
+  feat_rsi_14      RSI(14) on 5m close prices at Bar2 end — 动量超买超卖
+  feat_vol_ratio   Bar2 volume / rolling-20-bar avg volume — 成交量确信度
+  feat_body_str    Bar2 candle body ratio |close-open|/(high-low) — K 线形态强度
+  feat_mom_accel   Bar2 return - Bar1 return — 动量加速度
 """
 
 from __future__ import annotations
@@ -55,6 +68,26 @@ def compute_bar2_aggregates_vectorized(trades_1s) -> pd.DataFrame:
         "first_240s_trade_count": first240_ticks,
     })
     return out
+
+
+def _merge_kline_feature(
+    feats: pd.DataFrame,
+    kline_5m: pd.DataFrame,
+    col: str,
+    key: str = "bar2_start",
+    default: float = 0.0,
+) -> pd.Series:
+    """
+    将 kline_5m 中的一列安全合并到 feats（按 bar2_start 对齐），统一处理时区问题。
+    kline_5m 的 index 可能无时区；feats[key] 可能为 UTC。两端统一转为 UTC 后使用
+    asof 查找，避免 merge 的时区不一致 ValueError。
+    """
+    series = kline_5m[col].copy()
+    series.index = pd.to_datetime(series.index, utc=True)
+    series = series.sort_index()
+    keys_utc = pd.to_datetime(feats[key].values, utc=True)
+    values = pd.Series([series.asof(t) for t in keys_utc], index=feats.index)
+    return values.ffill().bfill().fillna(default)
 
 
 def compute_features(
@@ -145,11 +178,7 @@ def compute_features(
 
     # Feature 5: 4H VWAP 偏离度 (bps)，已在 5m 上按 48 根 K 线 rolling 算好，按 bar2_start 合并
     if "feat_5" in kline_5m.columns:
-        right = kline_5m[["feat_5"]].copy()
-        right.index.name = "bar2_start"
-        merged = feats[["bar2_start"]].merge(right, left_on="bar2_start", right_index=True, how="left")
-        merged.index = feats.index
-        feats["feat_5"] = merged["feat_5"].ffill().bfill().fillna(0.0)
+        feats["feat_5"] = _merge_kline_feature(feats, kline_5m, "feat_5", default=0.0)
     else:
         feats["feat_5"] = 0.0
 
@@ -176,17 +205,55 @@ def compute_features(
     atr_1h = tr.rolling(12, min_periods=1).mean()
     vol_regime = atr_1h / atr_24h.replace(0, np.nan)
     vol_regime = vol_regime.fillna(1.0).replace([np.inf, -np.inf], 1.0)
-    right = pd.DataFrame({"feat_vol_regime": vol_regime})
-    right.index.name = "bar2_start"
-    merged = feats[["bar2_start"]].merge(right, left_on="bar2_start", right_index=True, how="left")
-    merged.index = feats.index
-    feats["feat_vol_regime"] = merged["feat_vol_regime"].ffill().bfill().fillna(1.0)
+    k5["feat_vol_regime"] = vol_regime
+    feats["feat_vol_regime"] = _merge_kline_feature(feats, k5, "feat_vol_regime", default=1.0)
+
+    # -----------------------------------------------------------------------
+    # 扩展特征 V2 — 全部从 kline_5m 向量化计算，无未来数据
+    # -----------------------------------------------------------------------
+
+    # feat_rsi_14: RSI(14) on 5m close at Bar2 end
+    # RSI > 70 超买（动量可能耗尽），RSI < 30 超卖（反弹预期）
+    delta = k5["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=13, min_periods=1, adjust=False).mean()
+    avg_loss = loss.ewm(com=13, min_periods=1, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.fillna(50.0)
+    k5["feat_rsi_14"] = rsi
+    feats["feat_rsi_14"] = _merge_kline_feature(feats, k5, "feat_rsi_14", default=50.0)
+
+    # feat_vol_ratio: Bar2 volume / rolling-20-bar mean volume
+    # > 1 表示放量，说明本次连涨有成交量确认
+    vol_20_avg = k5["volume"].rolling(20, min_periods=1).mean().replace(0, np.nan)
+    k5["feat_vol_ratio"] = (k5["volume"] / vol_20_avg).fillna(1.0).replace([np.inf, -np.inf], 1.0)
+    feats["feat_vol_ratio"] = _merge_kline_feature(feats, k5, "feat_vol_ratio", default=1.0)
+
+    # feat_body_str: Bar2 candle body strength |close-open| / (high-low)
+    # 越接近 1 说明 K 线实体充实（无大 wick），趋势确信度高
+    bar_range = (k5["high"] - k5["low"]).replace(0, np.nan)
+    k5["feat_body_str"] = ((k5["close"] - k5["open"]).abs() / bar_range).fillna(0.5).clip(0.0, 1.0)
+    feats["feat_body_str"] = _merge_kline_feature(feats, k5, "feat_body_str", default=0.5)
+
+    # feat_mom_accel: Bar2 return - Bar1 return (动量加速度)
+    # 正值 = 加速上涨（Bar2 比 Bar1 涨幅更大）
+    k5_ret = (k5["close"] - k5["open"]) / k5["open"].replace(0, np.nan)
+    k5_ret = k5_ret.fillna(0.0)
+    k5_ret_lag = k5_ret.shift(1).fillna(0.0)
+    k5["feat_mom_accel"] = k5_ret - k5_ret_lag
+    feats["feat_mom_accel"] = _merge_kline_feature(feats, k5, "feat_mom_accel", default=0.0)
 
     # Target: Bar3 收阳 = 1（Bar3 对应 5m 的 bar3_start 那根 K 线）
-    bar3_start = feats["bar3_start"].values
-    bar3_open = kline_5m["open"].reindex(bar3_start).values
-    bar3_close = kline_5m["close"].reindex(bar3_start).values
-    feats["target"] = (bar3_close > bar3_open).astype(int)
+    bar3_start_tz = pd.to_datetime(feats["bar3_start"].values, utc=True)
+    k5_close_tz = kline_5m["close"].copy()
+    k5_open_tz = kline_5m["open"].copy()
+    k5_close_tz.index = pd.to_datetime(k5_close_tz.index, utc=True)
+    k5_open_tz.index = pd.to_datetime(k5_open_tz.index, utc=True)
+    bar3_open_vals = pd.Series([k5_open_tz.asof(t) for t in bar3_start_tz], index=feats.index)
+    bar3_close_vals = pd.Series([k5_close_tz.asof(t) for t in bar3_start_tz], index=feats.index)
+    feats["target"] = (bar3_close_vals > bar3_open_vals).astype(float)
     # 若 Bar3 尚未发生（无 close），则丢弃
     feats = feats.dropna(subset=["target"])
     feats["target"] = feats["target"].astype(int)
@@ -202,7 +269,12 @@ def compute_features(
 
     return feats[
         [
-            "t0", "snapshot_time", "feat_1", "feat_2", "feat_3", "feat_4", "feat_5",
+            "t0", "snapshot_time",
+            # V1 核心特征
+            "feat_1", "feat_2", "feat_3", "feat_4", "feat_5",
+            # V2 扩展特征
+            "feat_rsi_14", "feat_vol_ratio", "feat_body_str", "feat_mom_accel",
+            # 宏观/时序上下文（事后归因用）
             "feat_hour_sin", "feat_hour_cos", "feat_day_of_week", "feat_session", "feat_vol_regime",
             "target",
         ]

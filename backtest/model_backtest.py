@@ -35,6 +35,11 @@ except ImportError:
 warnings.filterwarnings("ignore", category=UserWarning)
 
 FEATURE_COLS = ["feat_1", "feat_2", "feat_3", "feat_4", "feat_5"]
+# V2 全量特征（含 V1 + 扩展因子）
+V2_ALL_FEATURES = [
+    "feat_1", "feat_2", "feat_3", "feat_4", "feat_5",
+    "feat_rsi_14", "feat_vol_ratio", "feat_body_str", "feat_mom_accel",
+]
 # V1 纯血模型：仅 feat_1/2/5，不引入时区/波动率等宏观特征（避免维度灾难与过拟合）
 V1_PURE_FEATURES = ["feat_1", "feat_2", "feat_5"]
 # 保留旧常量以兼容 Mock 等路径
